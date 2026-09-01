@@ -1,0 +1,24 @@
+INCUSION RED RIVER - UI / INVENTORY / ECONOMY FIX VALIDATION
+
+PASS: verified 116 reflected offsets against /mnt/data/incursion_max/IncursionCheat_DX12_Fixed/IncursionCheat_DX12/5.6.1-0+UE5-Test_C/GObjects-Dump-WithProperties.txt
+NOTE: global RVAs and ULevel::Actors are not UPROPERTY entries; run verify_fresh_dump_layout.py for current-build native-layout validation.
+PASS: fresh native UObject image layout matches the previous dump
+Module-backed objects: 50,035
+Added: 0 | Removed: 0
+Single ASLR relocation delta: -0x388c0000 across 50,035 objects
+Validated live UClass lookup indices: 101
+Conclusion: module-relative RVAs/native reflected layout are unchanged between these dumps.
+Baseline: /mnt/data/incursion_max/IncursionCheat_DX12_Fixed/IncursionCheat_DX12/5.6.1-0+UE5-Test_C/GObjects-Dump-WithProperties.txt
+Fresh: /mnt/data/incursion_max/IncursionCheat_DX12_Fixed/IncursionCheat_DX12/5.6.1-0+UE5-Test_C/GObjects-Dump.txt
+PASS: verified 113 item catalog entries against fresh package + IRRItemDefinition objects
+
+IncursionCheat_DX12/IncursionCheat_DX12.vcxproj: 0 missing project references
+IncursionCheat_DX12/Loader/Loader.vcxproj: 0 missing project references
+
+syntax: IncursionCheat_DX12/Features/InventoryService.cpp
+syntax: IncursionCheat_DX12/Menu.cpp
+syntax: IncursionCheat_DX12/Features/ProfileTools.cpp
+syntax: IncursionCheat_DX12/Features/Aimbot.cpp
+syntax: IncursionCheat_DX12/Features/Spawner.cpp
+
+No stale ItemCatalog ObjectIndex references.
