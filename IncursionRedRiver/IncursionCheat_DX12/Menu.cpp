@@ -500,7 +500,12 @@ void Menu::Render()
     const bool worldReady = GameAccess::GetWorld() != 0;
     const bool pawnReady = GameAccess::GetLocalPawn() != 0;
 
-    ImGui::BeginChild("##TopHeader", ImVec2(0.0f, 104.0f), true,
+    // Keep a complete text line below the runtime-status row. The previous
+    // 104 px child placed this row too close to the child clip rectangle once
+    // WindowPadding, the child border and display scaling were applied.
+    constexpr float headerHeight = 120.0f;
+    constexpr float statusRowY = 76.0f;
+    ImGui::BeginChild("##TopHeader", ImVec2(0.0f, headerHeight), true,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::SetCursorPosY(8.0f);
     ImGui::SetWindowFontScale(1.22f);
@@ -517,7 +522,7 @@ void Menu::Render()
 
     ImGui::SetCursorPosY(40.0f);
     ImGui::TextDisabled("Incursion: Red River  |  optimized internal toolkit");
-    ImGui::SetCursorPosY(68.0f);
+    ImGui::SetCursorPosY(statusRowY);
     StatusValue("HOOK", hookReady); ImGui::SameLine(0.0f, 16.0f);
     StatusValue("QUEUE", queueReady); ImGui::SameLine(0.0f, 16.0f);
     StatusValue("DX12", rendererReady); ImGui::SameLine(0.0f, 16.0f);
