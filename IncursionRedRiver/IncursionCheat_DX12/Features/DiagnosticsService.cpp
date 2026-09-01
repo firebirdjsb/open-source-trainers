@@ -62,6 +62,9 @@ namespace DiagnosticsService
         out << "Hook installed:       " << YesNo(IsHookInstalled()) << "\n";
         out << "Command queue:        " << YesNo(HasCapturedCommandQueue()) << "\n";
         out << "Renderer initialized: " << YesNo(IsRendererInitialized()) << "\n";
+        out << "Diagnostic caller thread: " << GetCurrentThreadId() << "\n";
+        out << "Game window thread:       " << GetGameWindowThreadId() << "\n";
+        out << "Last inventory-task thread: " << GetLastGameTaskThreadId() << "\n";
         Hex(out, "EXE module base", Memory::GetBase());
 
         const auto& d = GameAccess::GetDiagnostics();
@@ -169,7 +172,7 @@ namespace DiagnosticsService
         out << "Stash containers: " << stashProbe.MainContainerCount << '/'
             << stashProbe.MainContainerCapacity << " | item records: "
             << stashProbe.TotalContainerItems << " | valid: " << YesNo(stashProbe.MainArrayValid) << "\n";
-        const auto& inventoryResult = InventoryService::GetLastResult();
+        const auto inventoryResult = InventoryService::GetLastResult();
         out << "Last insertion: success=" << YesNo(inventoryResult.Success)
             << " backend=" << inventoryResult.Backend
             << " component=0x" << std::hex << inventoryResult.TargetComponent << std::dec

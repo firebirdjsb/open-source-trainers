@@ -2,6 +2,7 @@
 
 #include "ItemCatalog.h"
 #include "../Memory/Memory.h"
+#include "../hooks/PresentHook.h"
 #include "../sdk/GameAccess.h"
 #include "../sdk/Offsets.h"
 
@@ -9,6 +10,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace
@@ -40,6 +42,18 @@ namespace
     uintptr_t g_cachedStashInventory = 0;
 
     InventoryService::Result g_lastResult{};
+    std::mutex g_lastResultMutex;
+
+    void PublishResult(const InventoryService::Result& result)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_lastResultMutex);
+            g_lastResult = result;
+        }
+        DebugLog("[Inventory] thread=%lu success=%s backend=%s | %s\n",
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            result.Success ? "YES" : "NO", result.Backend, result.Message);
+    }
 
     struct WeaponPresetMapping
     {
@@ -343,8 +357,9 @@ namespace InventoryService
         return probe;
     }
 
-    const Result& GetLastResult()
+    Result GetLastResult()
     {
+        std::lock_guard<std::mutex> lock(g_lastResultMutex);
         return g_lastResult;
     }
 
@@ -389,24 +404,43 @@ namespace InventoryService
     {
         if (!inventoryComponent)
             return;
+        const unsigned long gameThread = GetGameWindowThreadId();
+        if (gameThread && GetCurrentThreadId() != gameThread)
+        {
+            DebugLog("[Inventory] BLOCKED RefreshInventory from non-game thread %lu (expected %lu).\n",
+                static_cast<unsigned long>(GetCurrentThreadId()), gameThread);
+            return;
+        }
         GameAccess::InvokeFunctionRaw(inventoryComponent,
             FunctionIndices::InventoryComponent_ItemsUpdated, nullptr, 0);
         GameAccess::InvokeFunctionRaw(inventoryComponent,
             FunctionIndices::InventoryComponent_UpdateCurrency, nullptr, 0);
-        GameAccess::InvokeFunctionRaw(inventoryComponent,
-            FunctionIndices::InventoryComponent_OnRepMainContainers, nullptr, 0);
+        // Never invoke OnRepMainContainers manually. AddDefaultItem/TryAddItem
+        // already mutate and notify the component. Forcing the replication
+        // handler a second time duplicated weapon-icon render targets and was
+        // correlated with an NVIDIA Aftermath stale-resource GPU page fault.
     }
 
     bool AddItem(const ItemCatalog::Entry& entry, int amount, Destination destination, Result* outResult)
     {
         Result result{};
+        const unsigned long gameThread = GetGameWindowThreadId();
+        if (gameThread && GetCurrentThreadId() != gameThread)
+        {
+            std::snprintf(result.Message, sizeof(result.Message),
+                "%s: BLOCKED inventory mutation from DX12/render thread %lu; expected game thread %lu",
+                entry.Id, static_cast<unsigned long>(GetCurrentThreadId()), gameThread);
+            PublishResult(result);
+            if (outResult) *outResult = result;
+            return false;
+        }
         const int clamped = std::clamp(amount, 1, 1000000);
         const uintptr_t definition = GameAccess::GetObjectByIndex(entry.DefinitionIndex);
         if (!definition)
         {
             std::snprintf(result.Message, sizeof(result.Message),
                 "%s: live IRRItemDefinition 0x%X unavailable", entry.Id, entry.DefinitionIndex);
-            g_lastResult = result;
+            PublishResult(result);
             if (outResult) *outResult = result;
             return false;
         }
@@ -420,7 +454,7 @@ namespace InventoryService
             std::snprintf(result.Message, sizeof(result.Message),
                 "%s x%d -> resource | %s (UNVERIFIED; not reported as success)",
                 entry.Id, clamped, dispatched ? "ProcessEvent dispatched" : "dispatch failed");
-            g_lastResult = result;
+            PublishResult(result);
             if (outResult) *outResult = result;
             return false;
         }
@@ -432,7 +466,7 @@ namespace InventoryService
         {
             std::snprintf(result.Message, sizeof(result.Message), "%s: %s component unavailable",
                 entry.Id, stash ? "stash" : "player inventory");
-            g_lastResult = result;
+            PublishResult(result);
             if (outResult) *outResult = result;
             return false;
         }
@@ -446,7 +480,7 @@ namespace InventoryService
                 entry.Id, stash ? "stash" : "inventory",
                 static_cast<unsigned long long>(initialProbe.MainArrayData),
                 initialProbe.MainContainerCount, initialProbe.MainContainerCapacity);
-            g_lastResult = result;
+            PublishResult(result);
             if (outResult) *outResult = result;
             return false;
         }
@@ -460,7 +494,7 @@ namespace InventoryService
             std::snprintf(result.Message, sizeof(result.Message),
                 "%s: %s construction failed; no bare/incomplete weapon was inserted",
                 entry.Id, completeWeapon ? "complete weapon preset" : "default item");
-            g_lastResult = result;
+            PublishResult(result);
             if (outResult) *outResult = result;
             return false;
         }
@@ -503,8 +537,6 @@ namespace InventoryService
                 ++result.DispatchCount;
                 anyDispatch = true;
                 result.ReturnedDefinition = returnedDefinition;
-                RefreshInventory(component);
-
                 int64_t unitCountAfter = CountItem(component, definition);
                 int32_t unitRecordsAfter = ProbeInventory(component).TotalContainerItems;
                 const bool rootAdded = unitCountAfter > unitCountBefore;
@@ -544,7 +576,6 @@ namespace InventoryService
                             ++result.DispatchCount;
                             result.TryAddReturned = result.TryAddReturned || added;
                             anyDispatch = true;
-                            RefreshInventory(component);
                             unitCountAfter = CountItem(component, definition);
                             if (unitCountAfter > unitCountBefore)
                             {
@@ -590,7 +621,7 @@ namespace InventoryService
                 result.ItemRecordsBefore, result.ItemRecordsAfter,
                 result.ExpectedAttachments);
         }
-        g_lastResult = result;
+        PublishResult(result);
         if (outResult) *outResult = result;
         return result.Success;
     }

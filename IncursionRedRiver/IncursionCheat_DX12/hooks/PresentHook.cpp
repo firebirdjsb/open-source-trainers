@@ -20,6 +20,8 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <cstdarg>
 #include <cstdio>
 #include <cwchar>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -31,6 +33,8 @@ namespace
     using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
     using ResizeBuffers1Fn = HRESULT(__stdcall*)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT*, IUnknown* const*);
     using ExecuteCommandListsFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+
+    constexpr UINT WmRunGameThreadTasks = WM_APP + 0x4A1;
 
     struct HookSlot
     {
@@ -148,6 +152,10 @@ namespace
     bool g_imguiWin32 = false;
     bool g_imguiDx12 = false;
     bool g_menuOpenLastFrame = false;
+    std::mutex g_gameTaskMutex;
+    std::deque<std::function<void()>> g_gameTasks;
+    std::atomic<DWORD> g_gameWindowThreadId{ 0 };
+    std::atomic<DWORD> g_lastGameTaskThreadId{ 0 };
 
     template <typename T>
     void SafeRelease(T*& ptr)
@@ -282,8 +290,32 @@ namespace
             WaitForFenceValue(value);
     }
 
+    void DrainGameThreadTasks()
+    {
+        std::deque<std::function<void()>> tasks;
+        {
+            std::lock_guard<std::mutex> lock(g_gameTaskMutex);
+            tasks.swap(g_gameTasks);
+        }
+        if (tasks.empty())
+            return;
+
+        const DWORD threadId = GetCurrentThreadId();
+        g_lastGameTaskThreadId.store(threadId);
+        DebugLog("[GameTask] Executing %zu queued operation(s) on window/game thread %lu.\n",
+            tasks.size(), static_cast<unsigned long>(threadId));
+        for (auto& task : tasks)
+            if (task) task();
+    }
+
     LRESULT CALLBACK HookWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
+        if (msg == WmRunGameThreadTasks)
+        {
+            DrainGameThreadTasks();
+            return 0;
+        }
+
         // Keep the menu hotkeys from leaking through to the game even when the menu
         // is currently closed. Toggle detection itself uses GetAsyncKeyState().
         if ((msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) &&
@@ -417,6 +449,7 @@ namespace
             ReleaseRendererLocked();
             return false;
         }
+        g_gameWindowThreadId.store(GetWindowThreadProcessId(g_hwnd, nullptr));
 
         g_rtvFormat = desc.BufferDesc.Format;
         if (g_rtvFormat == DXGI_FORMAT_UNKNOWN)
@@ -916,6 +949,12 @@ void ShutdownHook()
 
     g_gameQueue.store(nullptr);
     {
+        std::lock_guard<std::mutex> taskLock(g_gameTaskMutex);
+        g_gameTasks.clear();
+    }
+    g_gameWindowThreadId.store(0);
+    g_lastGameTaskThreadId.store(0);
+    {
         std::lock_guard<std::mutex> lock(g_queueMutex);
         for (ID3D12CommandQueue* queue : g_directQueueCandidates)
             if (queue) queue->Release();
@@ -933,3 +972,34 @@ void ShutdownHook()
 bool IsHookInstalled() { return g_hookInstalled.load(); }
 bool IsRendererInitialized() { return g_rendererInitialized.load(); }
 bool HasCapturedCommandQueue() { return g_gameQueue.load() != nullptr; }
+
+bool QueueGameThreadTask(std::function<void()> task)
+{
+    if (!task || g_shuttingDown.load())
+        return false;
+
+    const HWND hwnd = g_hwnd;
+    if (!hwnd || !IsWindow(hwnd))
+        return false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_gameTaskMutex);
+        g_gameTasks.emplace_back(std::move(task));
+        if (!PostMessageW(hwnd, WmRunGameThreadTasks, 0, 0))
+        {
+            g_gameTasks.pop_back();
+            return false;
+        }
+    }
+    return true;
+}
+
+unsigned long GetGameWindowThreadId()
+{
+    return static_cast<unsigned long>(g_gameWindowThreadId.load());
+}
+
+unsigned long GetLastGameTaskThreadId()
+{
+    return static_cast<unsigned long>(g_lastGameTaskThreadId.load());
+}

@@ -2,6 +2,7 @@
 
 #include "InventoryService.h"
 #include "ItemCatalog.h"
+#include "../hooks/PresentHook.h"
 #include "../sdk/GameAccess.h"
 #include "../sdk/Offsets.h"
 #include "../imgui/imgui.h"
@@ -9,8 +10,10 @@
 #include <Windows.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 namespace
@@ -38,9 +41,12 @@ namespace
     char g_factionName[96]{};
     char g_lastOperation[256] = "No profile operation submitted yet.";
     InventoryService::Result g_lastInventoryResult{};
+    std::atomic<bool> g_profileInventoryPending{ false };
+    std::mutex g_profileResultMutex;
 
     void SetStatus(const char* operation, bool dispatched)
     {
+        std::lock_guard<std::mutex> lock(g_profileResultMutex);
         std::snprintf(g_lastOperation, sizeof(g_lastOperation), "%s: %s",
             operation, dispatched ? "ProcessEvent dispatched" : "blocked / validation failed");
     }
@@ -60,6 +66,33 @@ namespace
 
     bool AddProfileItem(int32_t packageIndex, int amount, const char* label)
     {
+        const unsigned long gameThread = GetGameWindowThreadId();
+        if (!gameThread || GetCurrentThreadId() != gameThread)
+        {
+            if (g_profileInventoryPending.exchange(true))
+                return false;
+            const std::string labelCopy = label ? label : "Profile item";
+            {
+                std::lock_guard<std::mutex> lock(g_profileResultMutex);
+                std::snprintf(g_lastOperation, sizeof(g_lastOperation),
+                    "QUEUED: %s x%d on Unreal game thread", labelCopy.c_str(), amount);
+            }
+            const bool queued = QueueGameThreadTask([packageIndex, amount, labelCopy]()
+            {
+                AddProfileItem(packageIndex, amount, labelCopy.c_str());
+                g_profileInventoryPending.store(false);
+            });
+            if (!queued)
+            {
+                std::lock_guard<std::mutex> lock(g_profileResultMutex);
+                std::snprintf(g_lastOperation, sizeof(g_lastOperation),
+                    "%s: failed to queue on Unreal game thread", labelCopy.c_str());
+                g_profileInventoryPending.store(false);
+            }
+            return queued;
+        }
+
+        std::lock_guard<std::mutex> resultLock(g_profileResultMutex);
         const ItemCatalog::Entry* entry = FindCatalogEntry(packageIndex);
         if (!entry)
         {
@@ -91,6 +124,35 @@ namespace
         const bool ok = InventoryService::AddItem(*entry, amount, destination, &g_lastInventoryResult);
         std::snprintf(g_lastOperation, sizeof(g_lastOperation), "%s", g_lastInventoryResult.Message);
         return ok;
+    }
+
+    void QueueCurrencyRefresh(uintptr_t playerInventory, uintptr_t stashInventory)
+    {
+        if (g_profileInventoryPending.exchange(true))
+            return;
+        {
+            std::lock_guard<std::mutex> lock(g_profileResultMutex);
+            std::snprintf(g_lastOperation, sizeof(g_lastOperation),
+                "QUEUED: currency refresh on Unreal game thread");
+        }
+        const bool queued = QueueGameThreadTask([playerInventory, stashInventory]()
+        {
+            InventoryService::RefreshInventory(playerInventory);
+            InventoryService::RefreshInventory(stashInventory);
+            {
+                std::lock_guard<std::mutex> lock(g_profileResultMutex);
+                std::snprintf(g_lastOperation, sizeof(g_lastOperation),
+                    "Currency refresh submitted to inventory + stash.");
+            }
+            g_profileInventoryPending.store(false);
+        });
+        if (!queued)
+        {
+            std::lock_guard<std::mutex> lock(g_profileResultMutex);
+            std::snprintf(g_lastOperation, sizeof(g_lastOperation),
+                "Currency refresh: failed to queue on Unreal game thread");
+            g_profileInventoryPending.store(false);
+        }
     }
 
     std::wstring ToWide(const char* input)
@@ -172,11 +234,7 @@ namespace ProfileTools
             AddProfileItem(ObjectIndices::Package_ID_MarkedCoin, g_itemAmount, "Marked Coin");
         ImGui::SameLine();
         if (ImGui::Button("REFRESH CURRENCY", ImVec2(160.0f, 34.0f)))
-        {
-            InventoryService::RefreshInventory(playerInventory);
-            InventoryService::RefreshInventory(stashInventory);
-            std::snprintf(g_lastOperation, sizeof(g_lastOperation), "Currency refresh submitted to inventory + stash.");
-        }
+            QueueCurrencyRefresh(playerInventory, stashInventory);
 
         ImGui::Spacing();
         if (ImGui::BeginCombo("Profile item", ItemChoices[static_cast<size_t>(g_selectedItem)].Label))
@@ -229,15 +287,22 @@ namespace ProfileTools
             SetStatus("GeneralGameInstance.SetFactionReputation", SubmitFactionReputation());
 
         ImGui::Separator();
-        const ImVec4 statusColor = g_lastInventoryResult.Success ?
+        InventoryService::Result displayInventoryResult{};
+        std::array<char, 256> displayOperation{};
+        {
+            std::lock_guard<std::mutex> lock(g_profileResultMutex);
+            displayInventoryResult = g_lastInventoryResult;
+            std::snprintf(displayOperation.data(), displayOperation.size(), "%s", g_lastOperation);
+        }
+        const ImVec4 statusColor = displayInventoryResult.Success ?
             ImVec4(0.35f, 0.95f, 0.62f, 1.0f) : ImVec4(0.90f, 0.72f, 0.35f, 1.0f);
-        ImGui::TextColored(statusColor, "%s", g_lastOperation);
-        if (g_lastInventoryResult.TargetComponent)
+        ImGui::TextColored(statusColor, "%s", displayOperation.data());
+        if (displayInventoryResult.TargetComponent)
         {
             ImGui::TextDisabled("Inventory verification: %lld -> %lld | backend: %s | container: %d",
-                static_cast<long long>(g_lastInventoryResult.CountBefore),
-                static_cast<long long>(g_lastInventoryResult.CountAfter),
-                g_lastInventoryResult.Backend, g_lastInventoryResult.ContainerIndex);
+                static_cast<long long>(displayInventoryResult.CountBefore),
+                static_cast<long long>(displayInventoryResult.CountAfter),
+                displayInventoryResult.Backend, displayInventoryResult.ContainerIndex);
         }
         ImGui::TextDisabled("Profile changes may be save-backed. Test a small value first, then make a normal game save after verifying it.");
     }

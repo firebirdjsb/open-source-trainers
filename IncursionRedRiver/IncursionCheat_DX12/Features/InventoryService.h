@@ -49,7 +49,7 @@ namespace InventoryService
     uintptr_t GetStashInventory();
     int64_t CountItem(uintptr_t inventoryComponent, uintptr_t itemDefinition);
     InventoryProbe ProbeInventory(uintptr_t inventoryComponent);
-    const Result& GetLastResult();
+    Result GetLastResult();
     bool IsCompleteWeapon(const ItemCatalog::Entry& entry);
     bool AddItem(const ItemCatalog::Entry& entry, int amount, Destination destination, Result* outResult = nullptr);
     void RefreshInventory(uintptr_t inventoryComponent);

@@ -2,15 +2,19 @@
 
 #include "InventoryService.h"
 #include "ItemCatalog.h"
+#include "../hooks/PresentHook.h"
 #include "../sdk/GameAccess.h"
 #include "../imgui/imgui.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -43,6 +47,23 @@ namespace
     int g_destination = 0;
     InventoryService::Result g_lastResult{};
     char g_status[256] = "Ready. Direct inventory/stash insertion uses the game's InventoryComponent backend.";
+    std::atomic<bool> g_operationPending{ false };
+    std::mutex g_resultMutex;
+
+    void StoreResult(const InventoryService::Result& result, const char* status)
+    {
+        std::lock_guard<std::mutex> lock(g_resultMutex);
+        g_lastResult = result;
+        std::snprintf(g_status, sizeof(g_status), "%s", status ? status : result.Message);
+    }
+
+    void SnapshotResult(InventoryService::Result& result,
+                        std::array<char, 256>& status)
+    {
+        std::lock_guard<std::mutex> lock(g_resultMutex);
+        result = g_lastResult;
+        std::snprintf(status.data(), status.size(), "%s", g_status);
+    }
 
     bool ContainsInsensitive(const char* text, const char* needle)
     {
@@ -97,29 +118,80 @@ namespace
 
     bool SubmitItem(const ItemCatalog::Entry& entry, int amount)
     {
-        const bool ok = InventoryService::AddItem(entry, amount, Destination(), &g_lastResult);
-        std::snprintf(g_status, sizeof(g_status), "%s", g_lastResult.Message);
-        return ok;
+        if (g_operationPending.exchange(true))
+            return false;
+
+        const InventoryService::Destination destination = Destination();
+        const int requestedAmount = amount;
+        {
+            std::lock_guard<std::mutex> lock(g_resultMutex);
+            std::snprintf(g_status, sizeof(g_status),
+                "QUEUED: %s x%d -> %s on Unreal game thread",
+                entry.Id, requestedAmount,
+                destination == InventoryService::Destination::Stash ? "stash" : "inventory");
+        }
+
+        const bool queued = QueueGameThreadTask([entry, requestedAmount, destination]()
+        {
+            InventoryService::Result result{};
+            InventoryService::AddItem(entry, requestedAmount, destination, &result);
+            StoreResult(result, result.Message);
+            DebugLog("[Spawner] Completed %s on thread %lu (window thread %lu).\n",
+                entry.Id, GetLastGameTaskThreadId(),
+                GetGameWindowThreadId());
+            g_operationPending.store(false);
+        });
+        if (!queued)
+        {
+            InventoryService::Result result{};
+            std::snprintf(result.Message, sizeof(result.Message),
+                "%s: failed to queue operation on Unreal game thread", entry.Id);
+            StoreResult(result, result.Message);
+            g_operationPending.store(false);
+        }
+        return queued;
     }
 
     void AddPreset(std::initializer_list<std::pair<int32_t, int>> preset)
     {
-        int success = 0;
-        int attempted = 0;
-        InventoryService::Result last{};
-        for (const auto& wanted : preset)
+        if (g_operationPending.exchange(true))
+            return;
+        const std::vector<std::pair<int32_t, int>> requested(preset);
         {
-            const auto it = std::find_if(ItemCatalog::Entries.begin(), ItemCatalog::Entries.end(),
-                [&](const ItemCatalog::Entry& e) { return e.PackageIndex == wanted.first; });
-            if (it == ItemCatalog::Entries.end())
-                continue;
-            ++attempted;
-            success += InventoryService::AddItem(*it, wanted.second,
-                InventoryService::Destination::PlayerInventory, &last) ? 1 : 0;
+            std::lock_guard<std::mutex> lock(g_resultMutex);
+            std::snprintf(g_status, sizeof(g_status),
+                "QUEUED: quick kit (%zu entries) on Unreal game thread", requested.size());
         }
-        g_lastResult = last;
-        std::snprintf(g_status, sizeof(g_status),
-            "Quick kit -> player inventory: %d/%d verified item insertions", success, attempted);
+        const bool queued = QueueGameThreadTask([requested]()
+        {
+            int success = 0;
+            int attempted = 0;
+            InventoryService::Result last{};
+            for (const auto& wanted : requested)
+            {
+                const auto it = std::find_if(ItemCatalog::Entries.begin(), ItemCatalog::Entries.end(),
+                    [&](const ItemCatalog::Entry& e) { return e.PackageIndex == wanted.first; });
+                if (it == ItemCatalog::Entries.end())
+                    continue;
+                ++attempted;
+                success += InventoryService::AddItem(*it, wanted.second,
+                    InventoryService::Destination::PlayerInventory, &last) ? 1 : 0;
+            }
+            char status[256]{};
+            std::snprintf(status, sizeof(status),
+                "Quick kit -> player inventory: %d/%d verified item insertions",
+                success, attempted);
+            StoreResult(last, status);
+            g_operationPending.store(false);
+        });
+        if (!queued)
+        {
+            InventoryService::Result result{};
+            std::snprintf(result.Message, sizeof(result.Message),
+                "Quick kit: failed to queue operation on Unreal game thread");
+            StoreResult(result, result.Message);
+            g_operationPending.store(false);
+        }
     }
 }
 
@@ -127,11 +199,15 @@ namespace Spawner
 {
     void RenderTab()
     {
-        const uintptr_t playerInventory = InventoryService::GetPlayerInventory();
-        const uintptr_t stashInventory = InventoryService::GetStashInventory();
+        const bool operationPending = g_operationPending.load();
+        const uintptr_t playerInventory = operationPending ? 0 : InventoryService::GetPlayerInventory();
+        const uintptr_t stashInventory = operationPending ? 0 : InventoryService::GetStashInventory();
 
         ImGui::TextUnformatted("ITEM DELIVERY");
         ImGui::TextDisabled("Game-owned inventory insertion with before/after verification.");
+        ImGui::TextDisabled("Dispatch: window/game thread %lu | last task thread %lu | %s",
+            GetGameWindowThreadId(), GetLastGameTaskThreadId(),
+            operationPending ? "MUTATION PENDING" : "IDLE");
         ImGui::Spacing();
 
         ImGui::Text("Player inventory: 0x%llX", static_cast<unsigned long long>(playerInventory));
@@ -143,8 +219,10 @@ namespace Spawner
         ImGui::TextColored(stashInventory ? ImVec4(0.35f, 0.95f, 0.62f, 1.0f) : ImVec4(1.0f, 0.66f, 0.25f, 1.0f),
             stashInventory ? "  READY" : "  NOT RESOLVED");
 
-        const auto playerProbe = InventoryService::ProbeInventory(playerInventory);
-        const auto stashProbe = InventoryService::ProbeInventory(stashInventory);
+        const auto playerProbe = operationPending ? InventoryService::InventoryProbe{} :
+            InventoryService::ProbeInventory(playerInventory);
+        const auto stashProbe = operationPending ? InventoryService::InventoryProbe{} :
+            InventoryService::ProbeInventory(stashInventory);
         ImGui::TextDisabled("Inventory containers: %d/%d | item records: %d",
             playerProbe.MainContainerCount, playerProbe.MainContainerCapacity,
             playerProbe.TotalContainerItems);
@@ -213,48 +291,51 @@ namespace Spawner
             ImGui::TextDisabled("GUN PART: standalone definition (no complete-weapon preset)");
 
         const char* buttonLabel = g_destination == 0 ? "ADD TO INVENTORY" : "ADD TO STASH";
-        if (ImGui::Button(buttonLabel, ImVec2(190.0f, 34.0f)))
+        if (ImGui::Button(buttonLabel, ImVec2(190.0f, 34.0f)) && !g_operationPending.load())
             SubmitItem(selected, g_amount);
         ImGui::SameLine();
-        if (ImGui::Button("ADD x10", ImVec2(110.0f, 34.0f)))
+        if (ImGui::Button("ADD x10", ImVec2(110.0f, 34.0f)) && !g_operationPending.load())
             SubmitItem(selected, 10);
 
         ImGui::Separator();
         ImGui::TextUnformatted("QUICK KITS");
         ImGui::TextDisabled("Kits always target player inventory and verify each insertion.");
-        if (ImGui::Button("Medical kit"))
+        if (ImGui::Button("Medical kit") && !g_operationPending.load())
             AddPreset({ { 0xC653, 10 }, { 0xC85C, 10 } });
         ImGui::SameLine();
-        if (ImGui::Button("M4 starter kit"))
+        if (ImGui::Button("M4 starter kit") && !g_operationPending.load())
             AddPreset({ { 0xCB91, 1 }, { 0xD014, 8 }, { 0xC866, 240 } });
         ImGui::SameLine();
-        if (ImGui::Button("AK starter kit"))
+        if (ImGui::Button("AK starter kit") && !g_operationPending.load())
             AddPreset({ { 0xC8FC, 1 }, { 0xC8F5, 8 }, { 0xC85B, 240 } });
 
         ImGui::Spacing();
-        const ImVec4 statusColor = g_lastResult.Success ?
+        InventoryService::Result displayResult{};
+        std::array<char, 256> displayStatus{};
+        SnapshotResult(displayResult, displayStatus);
+        const ImVec4 statusColor = displayResult.Success ?
             ImVec4(0.35f, 0.95f, 0.62f, 1.0f) : ImVec4(0.90f, 0.72f, 0.35f, 1.0f);
-        ImGui::TextColored(statusColor, "%s", g_status);
-        if (g_lastResult.TargetComponent)
+        ImGui::TextColored(statusColor, "%s", displayStatus.data());
+        if (displayResult.TargetComponent)
         {
             ImGui::TextDisabled("Backend: %s | component: 0x%llX | container: %d | observed count: %lld -> %lld",
-                g_lastResult.Backend,
-                static_cast<unsigned long long>(g_lastResult.TargetComponent),
-                g_lastResult.ContainerIndex,
-                static_cast<long long>(g_lastResult.CountBefore),
-                static_cast<long long>(g_lastResult.CountAfter));
+                displayResult.Backend,
+                static_cast<unsigned long long>(displayResult.TargetComponent),
+                displayResult.ContainerIndex,
+                static_cast<long long>(displayResult.CountBefore),
+                static_cast<long long>(displayResult.CountAfter));
             ImGui::TextDisabled("MainContainers: %d | DefaultItem type: %d | dispatches: %d",
-                g_lastResult.MainContainerCount, g_lastResult.DefaultItemType,
-                g_lastResult.DispatchCount);
+                displayResult.MainContainerCount, displayResult.DefaultItemType,
+                displayResult.DispatchCount);
             ImGui::TextDisabled("Returned definition: 0x%llX | CanAdd: %s | TryAdd return: %s",
-                static_cast<unsigned long long>(g_lastResult.ReturnedDefinition),
-                g_lastResult.CanAddBuiltItem ? "YES" : "NO",
-                g_lastResult.TryAddReturned ? "YES" : "NO");
+                static_cast<unsigned long long>(displayResult.ReturnedDefinition),
+                displayResult.CanAddBuiltItem ? "YES" : "NO",
+                displayResult.TryAddReturned ? "YES" : "NO");
             ImGui::TextDisabled("Preset: 0x%llX | complete: %s | attachments: %d | records: %d -> %d",
-                static_cast<unsigned long long>(g_lastResult.PresetObject),
-                g_lastResult.CompleteWeapon ? "YES" : "NO",
-                g_lastResult.ExpectedAttachments,
-                g_lastResult.ItemRecordsBefore, g_lastResult.ItemRecordsAfter);
+                static_cast<unsigned long long>(displayResult.PresetObject),
+                displayResult.CompleteWeapon ? "YES" : "NO",
+                displayResult.ExpectedAttachments,
+                displayResult.ItemRecordsBefore, displayResult.ItemRecordsAfter);
         }
     }
 
