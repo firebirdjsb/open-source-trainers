@@ -75,6 +75,8 @@ namespace
     bool g_staminaFunctionDispatch = false;
     float g_staminaCurrent = 0.0f;
     float g_staminaMaximum = 0.0f;
+    int g_staminaValidatedChannels = 0;
+    int g_staminaFullChannels = 0;
     char g_staminaStatus[128] = "Safe reflected path idle";
 
     struct NoClipBackup
@@ -480,70 +482,114 @@ namespace
         g_staminaFunctionDispatch = false;
         g_staminaCurrent = 0.0f;
         g_staminaMaximum = 0.0f;
+        g_staminaValidatedChannels = 0;
+        g_staminaFullChannels = 0;
         std::snprintf(g_staminaStatus, sizeof(g_staminaStatus),
             "Safe reflected path idle");
     }
 
     void ApplyInfiniteStamina()
     {
-        const uintptr_t stamina = GameAccess::GetStaminaObject();
-        const uintptr_t attribute = GameAccess::GetStaminaAttribute();
-        if (!stamina || !attribute)
+        const auto& attributes = GameAccess::GetStaminaAttributes();
+        if (attributes.empty())
         {
             std::snprintf(g_staminaStatus, sizeof(g_staminaStatus),
-                "WAIT: validated FirstPersonStamina/attribute unavailable");
+                "WAIT: character/arm stamina attributes unavailable");
             return;
         }
-
-        float current = 0.0f;
-        float maximum = 0.0f;
-        bool currentOk = GameAccess::QueryFloatFunction(stamina,
-            FunctionIndices::FirstPersonStamina_GetCurrentStamina, current);
-        if (!currentOk)
-            currentOk = GameAccess::QueryFloatFunction(attribute,
-                FunctionIndices::SimpleGameplayAttribute_GetCurrentValue, current);
-        const bool maximumOk = GameAccess::QueryFloatFunction(attribute,
-            FunctionIndices::SimpleGameplayAttribute_GetCurrentMaxValue, maximum);
-
-        if (!currentOk || !maximumOk || !std::isfinite(current) ||
-            !std::isfinite(maximum) || maximum <= 0.0f || maximum > 100000.0f ||
-            current < -1000.0f || current > maximum * 4.0f)
-        {
-            std::snprintf(g_staminaStatus, sizeof(g_staminaStatus),
-                "BLOCKED: reflected stamina values failed sanity checks");
-            return;
-        }
-
-        g_staminaCurrent = current;
-        g_staminaMaximum = maximum;
 
         const ULONGLONG now = GetTickCount64();
-        if (current >= maximum - 0.01f)
+        const bool canApply = !g_staminaLastFunctionApply ||
+            now - g_staminaLastFunctionApply >= 200;
+        int validated = 0;
+        int full = 0;
+        int needed = 0;
+        int dispatched = 0;
+        float lowestRatio = 2.0f;
+        float lowestCurrent = 0.0f;
+        float lowestMaximum = 0.0f;
+
+        for (const uintptr_t attribute : attributes)
+        {
+            if (!attribute)
+                continue;
+
+            float current = 0.0f;
+            float maximum = 0.0f;
+            const bool currentOk = GameAccess::QueryFloatFunction(attribute,
+                FunctionIndices::SimpleGameplayAttribute_GetCurrentValue, current);
+            const bool maximumOk = GameAccess::QueryFloatFunction(attribute,
+                FunctionIndices::SimpleGameplayAttribute_GetCurrentMaxValue, maximum);
+            if (!currentOk || !maximumOk || !std::isfinite(current) ||
+                !std::isfinite(maximum) || maximum <= 0.0f || maximum > 100000.0f ||
+                current < -1000.0f || current > maximum * 4.0f)
+                continue;
+
+            ++validated;
+            float observed = current;
+            if (current < maximum - 0.01f)
+            {
+                ++needed;
+                if (canApply)
+                {
+                    float params = maximum;
+                    const bool applied = GameAccess::InvokeFunctionRaw(attribute,
+                        FunctionIndices::SimpleGameplayAttribute_SetBaseValue,
+                        &params, sizeof(params));
+                    if (applied)
+                    {
+                        ++dispatched;
+                        if (GameAccess::QueryFloatFunction(attribute,
+                                FunctionIndices::SimpleGameplayAttribute_GetCurrentValue,
+                                observed) && std::isfinite(observed))
+                            current = observed;
+                    }
+                }
+            }
+
+            if (current >= maximum - 0.01f)
+                ++full;
+            const float ratio = current / maximum;
+            if (ratio < lowestRatio)
+            {
+                lowestRatio = ratio;
+                lowestCurrent = current;
+                lowestMaximum = maximum;
+            }
+        }
+
+        g_staminaValidatedChannels = validated;
+        g_staminaFullChannels = full;
+        g_staminaCurrent = lowestCurrent;
+        g_staminaMaximum = lowestMaximum;
+        if (canApply && needed > 0)
+        {
+            g_staminaLastFunctionApply = now;
+            g_staminaFunctionDispatch = dispatched == needed;
+        }
+
+        if (validated == 0)
         {
             std::snprintf(g_staminaStatus, sizeof(g_staminaStatus),
-                "SAFE: full %.1f / %.1f", current, maximum);
-            return;
+                "BLOCKED: both stamina channels failed validation");
         }
-        if (g_staminaLastFunctionApply && now - g_staminaLastFunctionApply < 200)
-            return;
-
-        float params = maximum;
-        g_staminaFunctionDispatch = GameAccess::InvokeFunctionRaw(attribute,
-            FunctionIndices::SimpleGameplayAttribute_SetBaseValue,
-            &params, sizeof(params));
-        g_staminaLastFunctionApply = now;
-
-        float observed = current;
-        if (g_staminaFunctionDispatch &&
-            GameAccess::QueryFloatFunction(attribute,
-                FunctionIndices::SimpleGameplayAttribute_GetCurrentValue, observed) &&
-            std::isfinite(observed))
-            g_staminaCurrent = observed;
-
-        std::snprintf(g_staminaStatus, sizeof(g_staminaStatus),
-            "%s: %.1f / %.1f",
-            g_staminaFunctionDispatch ? "SAFE SetBaseValue" : "DISPATCH FAILED",
-            g_staminaCurrent, g_staminaMaximum);
+        else if (full == validated)
+        {
+            std::snprintf(g_staminaStatus, sizeof(g_staminaStatus),
+                "SAFE: %d/%d character + arm channels full", full, validated);
+        }
+        else if (!canApply)
+        {
+            std::snprintf(g_staminaStatus, sizeof(g_staminaStatus),
+                "MONITOR: %d/%d channels full", full, validated);
+        }
+        else
+        {
+            std::snprintf(g_staminaStatus, sizeof(g_staminaStatus),
+                "%s: %d/%d channels restored",
+                g_staminaFunctionDispatch ? "SAFE SetBaseValue" : "PARTIAL DISPATCH",
+                dispatched, needed);
+        }
     }
 
     void ApplyNoRecoil()
@@ -876,11 +922,13 @@ namespace UECheats
             if (bInfiniteStamina) ApplyInfiniteStamina();
             else RestoreInfiniteStamina();
         }
-        ImGui::Text("Stamina objects: %d | current/max: %.1f / %.1f",
+        ImGui::Text("Stamina channels: %d discovered | %d validated | %d full",
             GameAccess::GetDiagnostics().StaminaAttributeCount,
+            g_staminaValidatedChannels, g_staminaFullChannels);
+        ImGui::Text("Lowest channel current/max: %.1f / %.1f",
             g_staminaCurrent, g_staminaMaximum);
         ImGui::TextDisabled("%s", g_staminaStatus);
-        ImGui::TextDisabled("Crash fix: no RecoverPerSecond or raw attribute snapshot writes are used.");
+        ImGui::TextDisabled("Covers character/sprint and arm/aim stamina; no raw attribute writes are used.");
         if (ImGui::Checkbox("Invisible to AI", &bInvisible))
         {
             if (bInvisible) ApplyInvisible();

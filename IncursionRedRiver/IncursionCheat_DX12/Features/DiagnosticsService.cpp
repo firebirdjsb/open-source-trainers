@@ -134,14 +134,24 @@ namespace DiagnosticsService
         Hex(out, "SenseStimulusComponent", d.SenseStimulusComponent);
         Hex(out, "FirstPersonStamina", d.StaminaObject);
         Hex(out, "StaminaAttribute", d.StaminaAttribute);
-        out << "Owned stamina attributes: " << d.StaminaAttributeCount << "\n";
-        float staminaCurrent = 0.0f, staminaMax = 0.0f;
-        const bool staminaCurOk = d.StaminaAttribute && GameAccess::QueryFloatFunction(
-            d.StaminaAttribute, FunctionIndices::SimpleGameplayAttribute_GetCurrentValue, staminaCurrent);
-        const bool staminaMaxOk = d.StaminaAttribute && GameAccess::QueryFloatFunction(
-            d.StaminaAttribute, FunctionIndices::SimpleGameplayAttribute_GetCurrentMaxValue, staminaMax);
-        out << "Stamina reflected values: current=" << staminaCurrent << " (" << YesNo(staminaCurOk)
-            << ") max=" << staminaMax << " (" << YesNo(staminaMaxOk) << ")\n";
+        const auto& staminaAttributes = GameAccess::GetStaminaAttributes();
+        out << "Owned stamina attributes: " << staminaAttributes.size()
+            << " (character/sprint + arms/aim expected)\n";
+        for (std::size_t index = 0; index < staminaAttributes.size(); ++index)
+        {
+            const uintptr_t attribute = staminaAttributes[index];
+            const std::string label = "Stamina channel[" + std::to_string(index) + "] attribute";
+            Hex(out, label.c_str(), attribute);
+
+            float staminaCurrent = 0.0f;
+            float staminaMax = 0.0f;
+            const bool staminaCurOk = GameAccess::QueryFloatFunction(
+                attribute, FunctionIndices::SimpleGameplayAttribute_GetCurrentValue, staminaCurrent);
+            const bool staminaMaxOk = GameAccess::QueryFloatFunction(
+                attribute, FunctionIndices::SimpleGameplayAttribute_GetCurrentMaxValue, staminaMax);
+            out << "  reflected values: current=" << staminaCurrent << " (" << YesNo(staminaCurOk)
+                << ") max=" << staminaMax << " (" << YesNo(staminaMaxOk) << ")\n";
+        }
         out << "Infinite stamina implementation: SAFE reflected SetBaseValue only; raw stamina writes disabled.\n";
 
         out << "\n=== INVENTORY / STASH ===\n";
@@ -168,6 +178,11 @@ namespace DiagnosticsService
             << " type=" << inventoryResult.DefaultItemType
             << " dispatches=" << inventoryResult.DispatchCount
             << " count=" << inventoryResult.CountBefore << "->" << inventoryResult.CountAfter
+            << " records=" << inventoryResult.ItemRecordsBefore << "->"
+            << inventoryResult.ItemRecordsAfter
+            << " completeWeapon=" << YesNo(inventoryResult.CompleteWeapon)
+            << " preset=0x" << std::hex << inventoryResult.PresetObject << std::dec
+            << " expectedAttachments=" << inventoryResult.ExpectedAttachments
             << " returnedDef=0x" << std::hex << inventoryResult.ReturnedDefinition << std::dec
             << " canAdd=" << YesNo(inventoryResult.CanAddBuiltItem)
             << " tryAdd=" << YesNo(inventoryResult.TryAddReturned) << "\n";

@@ -294,6 +294,7 @@ namespace FunctionIndices
     constexpr int32_t InventoryFunctionLibrary_AddItemByRowName = 0x6F99;
     constexpr int32_t InventoryFunctionLibrary_GetPlayerInventoryComponent = 0x6FBA;
     constexpr int32_t InventoryFunctionLibrary_GetStashInventoryComponent = 0x6FBD;
+    constexpr int32_t IRRItemPreset_GetDefaultItem = 0x6DEE;
     constexpr int32_t IRRBodyComponent_GetBodyPartLocation = 0x6DBF;
     constexpr int32_t IRRBodyComponent_GetEyeLocation = 0x6DC0;
 }

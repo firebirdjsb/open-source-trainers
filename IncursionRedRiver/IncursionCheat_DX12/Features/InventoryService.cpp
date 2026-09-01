@@ -25,6 +25,11 @@ namespace
     constexpr size_t ContainerItemStride = 0xF8;
     constexpr size_t ContainerItem_Definition = 0x10;
     constexpr size_t ContainerItem_Count = 0xE8;
+    constexpr size_t DefaultItemStride = 0x1E8;
+    constexpr size_t DefaultItem_ItemType = 0x08;
+    constexpr size_t DefaultItem_ItemDefinition = 0x18;
+    constexpr size_t DefaultItem_DefaultAttachments = 0x20;
+    constexpr size_t DefaultItem_Count = 0x1E0;
     constexpr size_t AddDefaultItemParamsSize = 0x2E8;
     constexpr size_t AddDefaultItem_MainContainerIndex = 0x1E8;
     constexpr size_t AddDefaultItem_InContainerIndex = 0x1EC;
@@ -36,6 +41,39 @@ namespace
 
     InventoryService::Result g_lastResult{};
 
+    struct WeaponPresetMapping
+    {
+        int32_t DefinitionIndex = 0;
+        int32_t PresetIndex = 0;
+    };
+
+    // Current Dumper-7 IRRItemDefinition -> IRRItemPreset pairs. A complete gun
+    // must be built from the preset: the base definition alone is only the root
+    // receiver and produces an immovable/incomplete inventory record.
+    constexpr std::array<WeaponPresetMapping, 11> WeaponPresets = {{
+        { 0x14493, 0x14472 }, // AK-104
+        { 0x1482C, 0x1481F }, // Remington M700
+        { 0x14898, 0x14886 }, // Glock 19
+        { 0x14483, 0x14484 }, // AK-74M
+        { 0x14710, 0x14711 }, // QSZ-92
+        { 0x147D4, 0x147D5 }, // AKS-74U
+        { 0x146B2, 0x146B3 }, // Simonov SKS
+        { 0x14603, 0x14604 }, // MP5SD
+        { 0x1456F, 0x14570 }, // Colt M4A1
+        { 0x143CE, 0x143CF }, // KRISS Vector .45
+        { 0x14301, 0x142F9 }  // RIA VR80
+    }};
+
+    int32_t FindWeaponPresetIndex(int32_t definitionIndex)
+    {
+        const auto found = std::find_if(WeaponPresets.begin(), WeaponPresets.end(),
+            [definitionIndex](const WeaponPresetMapping& mapping)
+            {
+                return mapping.DefinitionIndex == definitionIndex;
+            });
+        return found == WeaponPresets.end() ? 0 : found->PresetIndex;
+    }
+
     bool PlausibleArray(const TArrayHeader& array, int32_t maxCount)
     {
         if (array.Count < 0 || array.Capacity < array.Count || array.Capacity > maxCount)
@@ -43,17 +81,6 @@ namespace
         if (array.Count == 0)
             return true;
         return array.Data && Memory::IsReadable(array.Data, 1);
-    }
-
-    uintptr_t WorldContext()
-    {
-        if (const uintptr_t pawn = GameAccess::GetLocalPawn())
-            return pawn;
-        if (const uintptr_t controller = GameAccess::GetLocalController())
-            return controller;
-        if (const uintptr_t instance = GameAccess::GetGameInstance())
-            return instance;
-        return GameAccess::GetWorld();
     }
 
     uintptr_t ResolveInventoryThroughLibrary(int32_t functionIndex)
@@ -95,25 +122,80 @@ namespace
         return main.Count;
     }
 
-    bool AddDefaultItem(uintptr_t component, uintptr_t definition, int amount,
+    bool BuildDefaultItem(const ItemCatalog::Entry& entry, uintptr_t definition,
+                          int amount,
+                          std::array<unsigned char, DefaultItemStride>& defaultItem,
+                          InventoryService::Result& result)
+    {
+        defaultItem.fill(0);
+        const int32_t presetIndex = FindWeaponPresetIndex(entry.DefinitionIndex);
+        if (presetIndex)
+        {
+            const uintptr_t preset = GameAccess::GetObjectByIndex(presetIndex);
+            if (!preset || !Memory::IsReadable(preset, sizeof(uintptr_t)))
+                return false;
+
+            if (!GameAccess::InvokeFunctionRaw(preset,
+                    FunctionIndices::IRRItemPreset_GetDefaultItem,
+                    defaultItem.data(), defaultItem.size()))
+                return false;
+
+            uintptr_t presetDefinition = 0;
+            std::memcpy(&presetDefinition,
+                defaultItem.data() + DefaultItem_ItemDefinition,
+                sizeof(presetDefinition));
+            if (presetDefinition != definition)
+                return false;
+
+            result.CompleteWeapon = true;
+            result.PresetObject = preset;
+        }
+        else
+        {
+            // EDefaultItemType::ItemDefinition is value 1 in this build.
+            const uint8_t definitionType = 1;
+            std::memcpy(defaultItem.data() + DefaultItem_ItemType,
+                &definitionType, sizeof(definitionType));
+            std::memcpy(defaultItem.data() + DefaultItem_ItemDefinition,
+                &definition, sizeof(definition));
+        }
+
+        const int32_t clamped = std::clamp(amount, 1, 1000000);
+        std::memcpy(defaultItem.data() + DefaultItem_Count,
+            &clamped, sizeof(clamped));
+
+        uint8_t itemType = 0;
+        std::memcpy(&itemType, defaultItem.data() + DefaultItem_ItemType,
+            sizeof(itemType));
+        result.DefaultItemType = static_cast<int32_t>(itemType);
+
+        TArrayHeader attachments{};
+        std::memcpy(&attachments,
+            defaultItem.data() + DefaultItem_DefaultAttachments,
+            sizeof(attachments));
+        if (!PlausibleArray(attachments, 128))
+            return false;
+        result.ExpectedAttachments = attachments.Count;
+
+        // All mapped firearm presets in the current dump contain their vital
+        // parts. Refuse to create a bare receiver if a stale/mismatched preset
+        // unexpectedly resolves without attachments.
+        return !result.CompleteWeapon || result.ExpectedAttachments > 0;
+    }
+
+    bool AddDefaultItem(uintptr_t component,
+                        const std::array<unsigned char, DefaultItemStride>& defaultItem,
                         int32_t mainContainerIndex, int32_t inContainerIndex,
-                        uint8_t itemType,
                         std::array<unsigned char, ContainerItemStride>& returnedItem,
                         uintptr_t& returnedDefinition)
     {
         returnedItem.fill(0);
         returnedDefinition = 0;
-        if (!component || !definition || amount <= 0)
+        if (!component)
             return false;
 
         alignas(8) std::array<unsigned char, AddDefaultItemParamsSize> params{};
-        // EDefaultItemType names are not emitted by Dumper-7. The old build sent
-        // zero only and runtime testing showed a no-op dispatch, so the caller probes
-        // the definition-oriented enum value first and falls back to zero.
-        std::memcpy(params.data() + 0x08, &itemType, sizeof(itemType));
-        std::memcpy(params.data() + 0x18, &definition, sizeof(definition));
-        const int32_t clamped = std::clamp(amount, 1, 1000000);
-        std::memcpy(params.data() + 0x1E0, &clamped, sizeof(clamped));
+        std::memcpy(params.data(), defaultItem.data(), defaultItem.size());
         std::memcpy(params.data() + AddDefaultItem_MainContainerIndex, &mainContainerIndex, sizeof(mainContainerIndex));
         std::memcpy(params.data() + AddDefaultItem_InContainerIndex, &inContainerIndex, sizeof(inContainerIndex));
 
@@ -169,55 +251,6 @@ namespace
             return false;
         outAdded = params[0x101] != 0;
         return true;
-    }
-
-    bool AddByRowNameFallback(const ItemCatalog::Entry& entry, int amount)
-    {
-        const uintptr_t library = GameAccess::GetObjectByIndex(ObjectIndices::DefaultInventoryFunctionLibrary);
-        const uintptr_t context = WorldContext();
-        if (!library || !context)
-            return false;
-
-        FName name{};
-        if (!GameAccess::GetObjectNameToken(entry.DefinitionIndex, name))
-            return false;
-
-        struct alignas(8) Params
-        {
-            uintptr_t WorldContextObject = 0;
-            FName Name{};
-            int32_t Count = 0;
-            int32_t Padding = 0;
-        } params{};
-        params.WorldContextObject = context;
-        params.Name = name;
-        params.Count = std::clamp(amount, 1, 1000000);
-        return GameAccess::InvokeFunctionRaw(library,
-            FunctionIndices::InventoryFunctionLibrary_AddItemByRowName,
-            &params, sizeof(params));
-    }
-
-
-    bool AddThroughGameInstance(const ItemCatalog::Entry& entry, int amount)
-    {
-        const uintptr_t gameInstance = GameAccess::GetGameInstance();
-        if (!gameInstance)
-            return false;
-
-        FName name{};
-        if (!GameAccess::GetObjectNameToken(entry.DefinitionIndex, name))
-            return false;
-
-        struct alignas(8) Params
-        {
-            FName Name{};
-            int32_t Amount = 0;
-            int32_t Padding = 0;
-        } params{};
-        params.Name = name;
-        params.Amount = std::clamp(amount, 1, 1000000);
-        return GameAccess::InvokeFunctionRaw(gameInstance,
-            FunctionIndices::GeneralGameInstance_AddItem, &params, sizeof(params));
     }
 
     bool AddResourceFallback(const ItemCatalog::Entry& entry, int amount)
@@ -313,6 +346,11 @@ namespace InventoryService
     const Result& GetLastResult()
     {
         return g_lastResult;
+    }
+
+    bool IsCompleteWeapon(const ItemCatalog::Entry& entry)
+    {
+        return FindWeaponPresetIndex(entry.DefinitionIndex) != 0;
     }
 
     int64_t CountItem(uintptr_t inventoryComponent, uintptr_t itemDefinition)
@@ -413,115 +451,145 @@ namespace InventoryService
             return false;
         }
 
+        const bool completeWeapon = IsCompleteWeapon(entry);
+        const int requestedAmount = completeWeapon ? std::min(clamped, 10) : clamped;
+        std::array<unsigned char, DefaultItemStride> defaultItem{};
+        if (!BuildDefaultItem(entry, definition,
+                completeWeapon ? 1 : requestedAmount, defaultItem, result))
+        {
+            std::snprintf(result.Message, sizeof(result.Message),
+                "%s: %s construction failed; no bare/incomplete weapon was inserted",
+                entry.Id, completeWeapon ? "complete weapon preset" : "default item");
+            g_lastResult = result;
+            if (outResult) *outResult = result;
+            return false;
+        }
+
         result.CountBefore = CountItem(component, definition);
         result.CountAfter = result.CountBefore;
+        result.ItemRecordsBefore = initialProbe.TotalContainerItems;
+        result.ItemRecordsAfter = initialProbe.TotalContainerItems;
         bool anyDispatch = false;
-        const char* lastDispatch = "none";
+        bool incompleteWeaponDetected = false;
+        int addedUnits = 0;
+        const char* directBackend = completeWeapon ?
+            "InventoryComponent.AddDefaultItem(preset)" :
+            "InventoryComponent.AddDefaultItem(definition)";
+        const char* lastDispatch = directBackend;
 
-        auto verifyChange = [&](const char* backend, int32_t containerIndex) -> bool
-        {
-            RefreshInventory(component);
-            const int64_t after = CountItem(component, definition);
-            result.CountAfter = after;
-            if (after > result.CountBefore)
-            {
-                result.Success = true;
-                result.Backend = backend;
-                result.ContainerIndex = containerIndex;
-                return true;
-            }
-            return false;
-        };
+        const int32_t mainCount = GetMainContainerCount(component);
+        std::vector<int32_t> candidates;
+        candidates.reserve(static_cast<size_t>(mainCount) + 1);
+        candidates.push_back(-1);
+        for (int32_t i = 0; i < mainCount; ++i)
+            candidates.push_back(i);
 
-        if (!stash)
+        const int unitsToCreate = completeWeapon ? requestedAmount : 1;
+        for (int unit = 0; unit < unitsToCreate; ++unit)
         {
-            if (AddByRowNameFallback(entry, clamped))
+            const int64_t unitCountBefore = CountItem(component, definition);
+            const int32_t unitRecordsBefore = ProbeInventory(component).TotalContainerItems;
+            bool unitAdded = false;
+
+            for (const int32_t containerIndex : candidates)
             {
+                std::array<unsigned char, ContainerItemStride> returnedItem{};
+                uintptr_t returnedDefinition = 0;
+                if (!AddDefaultItem(component, defaultItem, containerIndex, -1,
+                                    returnedItem, returnedDefinition))
+                    continue;
+
+                lastDispatch = directBackend;
                 ++result.DispatchCount;
                 anyDispatch = true;
-                lastDispatch = "InventoryFunctionLibrary.AddItemByRowName";
-                if (verifyChange(lastDispatch, -1))
-                    goto done;
-            }
-        }
+                result.ReturnedDefinition = returnedDefinition;
+                RefreshInventory(component);
 
-        if (AddThroughGameInstance(entry, clamped))
-        {
-            ++result.DispatchCount;
-            anyDispatch = true;
-            lastDispatch = "GeneralGameInstance.AddItem";
-            if (verifyChange(lastDispatch, -1))
-                goto done;
-        }
+                int64_t unitCountAfter = CountItem(component, definition);
+                int32_t unitRecordsAfter = ProbeInventory(component).TotalContainerItems;
+                const bool rootAdded = unitCountAfter > unitCountBefore;
+                const int32_t addedRecords = unitRecordsAfter - unitRecordsBefore;
+                const bool completePresetAdded = !completeWeapon ||
+                    addedRecords >= result.ExpectedAttachments + 1;
 
-        {
-            const int32_t mainCount = GetMainContainerCount(component);
-            std::vector<int32_t> candidates;
-            candidates.reserve(static_cast<size_t>(mainCount) + 1);
-            candidates.push_back(-1);
-            for (int32_t i = 0; i < mainCount; ++i)
-                candidates.push_back(i);
-
-            for (const uint8_t itemType : { uint8_t{1}, uint8_t{0} })
-            {
-                for (const int32_t containerIndex : candidates)
+                if (rootAdded && completePresetAdded)
                 {
-                    std::array<unsigned char, ContainerItemStride> returnedItem{};
-                    uintptr_t returnedDefinition = 0;
-                    if (!AddDefaultItem(component, definition, clamped, containerIndex, -1,
-                                        itemType, returnedItem, returnedDefinition))
-                        continue;
+                    result.ContainerIndex = containerIndex;
+                    result.Backend = directBackend;
+                    unitAdded = true;
+                    break;
+                }
 
-                    ++result.DispatchCount;
-                    anyDispatch = true;
-                    result.DefaultItemType = static_cast<int32_t>(itemType);
-                    result.ReturnedDefinition = returnedDefinition;
-                    lastDispatch = "InventoryComponent.AddDefaultItem";
-                    if (verifyChange(lastDispatch, containerIndex))
-                        goto done;
+                if (completeWeapon && rootAdded)
+                {
+                    // Never feed just the returned root through TryAddItem: that
+                    // strips its preset children and recreates the broken gun.
+                    incompleteWeaponDetected = true;
+                    break;
+                }
 
-                    if (returnedDefinition == definition)
+                if (!completeWeapon && returnedDefinition == definition)
+                {
+                    bool canAdd = false;
+                    const bool canAddQueried =
+                        CanAddBuiltItem(component, returnedItem, canAdd);
+                    if (canAddQueried)
+                        result.CanAddBuiltItem = result.CanAddBuiltItem || canAdd;
+
+                    if (canAddQueried && canAdd)
                     {
-                        bool canAdd = false;
-                        const bool canAddQueried = CanAddBuiltItem(component, returnedItem, canAdd);
-                        if (canAddQueried)
-                            result.CanAddBuiltItem = result.CanAddBuiltItem || canAdd;
-
-                        // Only enter TryAddItem when the game's own CanAddToInventory
-                        // accepted the game-built ContainerItem. This keeps the fallback
-                        // conservative and avoids feeding an invalid item into native code.
-                        if (canAddQueried && canAdd)
+                        bool added = false;
+                        if (TryAddBuiltItem(component, returnedItem, added))
                         {
-                            bool added = false;
-                            if (TryAddBuiltItem(component, returnedItem, added))
+                            ++result.DispatchCount;
+                            result.TryAddReturned = result.TryAddReturned || added;
+                            anyDispatch = true;
+                            RefreshInventory(component);
+                            unitCountAfter = CountItem(component, definition);
+                            if (unitCountAfter > unitCountBefore)
                             {
-                                ++result.DispatchCount;
-                                result.TryAddReturned = result.TryAddReturned || added;
-                                anyDispatch = true;
-                                lastDispatch = "InventoryComponent.TryAddItem(game-built return)";
-                                if (verifyChange(lastDispatch, containerIndex))
-                                    goto done;
+                                lastDispatch =
+                                    "InventoryComponent.TryAddItem(game-built definition)";
+                                result.ContainerIndex = containerIndex;
+                                result.Backend = lastDispatch;
+                                unitAdded = true;
+                                break;
                             }
                         }
                     }
                 }
             }
+
+            if (!unitAdded)
+                break;
+            ++addedUnits;
         }
 
-    done:
+        result.CountAfter = CountItem(component, definition);
+        result.ItemRecordsAfter = ProbeInventory(component).TotalContainerItems;
+        result.Success = addedUnits == unitsToCreate && addedUnits > 0;
         if (!result.Success)
-        {
             result.Backend = lastDispatch;
-            result.CountAfter = CountItem(component, definition);
-        }
 
-        std::snprintf(result.Message, sizeof(result.Message),
-            "%s x%d -> %s | %s | count %lld -> %lld | containers %d | type %d | dispatches %d",
-            entry.Id, clamped, stash ? "stash" : "inventory",
-            result.Success ? result.Backend :
-                (anyDispatch ? "DISPATCHED BUT NO VERIFIED INVENTORY CHANGE" : "NO BACKEND DISPATCH"),
-            static_cast<long long>(result.CountBefore), static_cast<long long>(result.CountAfter),
-            result.MainContainerCount, result.DefaultItemType, result.DispatchCount);
+        if (incompleteWeaponDetected)
+        {
+            std::snprintf(result.Message, sizeof(result.Message),
+                "%s -> %s | BLOCKED: root appeared without %d preset attachments",
+                entry.Id, stash ? "stash" : "inventory",
+                result.ExpectedAttachments);
+        }
+        else
+        {
+            std::snprintf(result.Message, sizeof(result.Message),
+                "%s x%d -> %s | %s | roots %lld -> %lld | records %d -> %d | attachments %d",
+                entry.Id, requestedAmount, stash ? "stash" : "inventory",
+                result.Success ? result.Backend :
+                    (anyDispatch ? "NO VERIFIED CONTAINER INSERTION" : "NO BACKEND DISPATCH"),
+                static_cast<long long>(result.CountBefore),
+                static_cast<long long>(result.CountAfter),
+                result.ItemRecordsBefore, result.ItemRecordsAfter,
+                result.ExpectedAttachments);
+        }
         g_lastResult = result;
         if (outResult) *outResult = result;
         return result.Success;

@@ -17,18 +17,19 @@ namespace
     enum class Category
     {
         All = 0,
-        Weapons,
+        CompleteWeapons,
+        GunParts,
         AmmoMags,
         Medical,
         ArmorGear,
-        Attachments,
+        OpticsAccessories,
         ResourcesUtility,
         Count
     };
 
     constexpr std::array<const char*, static_cast<size_t>(Category::Count)> CategoryNames = {{
-        "All", "Weapons", "Ammo / magazines", "Medical", "Armor / gear",
-        "Attachments / optics", "Resources / utility"
+        "All", "Complete weapons", "Gun parts", "Ammo / magazines", "Medical",
+        "Armor / gear", "Optics / accessories", "Resources / utility"
     }};
 
     constexpr std::array<const char*, 2> DestinationNames = {{
@@ -65,18 +66,25 @@ namespace
         return false;
     }
 
-    Category Classify(const char* id)
+    Category Classify(const ItemCatalog::Entry& entry)
     {
+        const char* id = entry.Id;
+        if (InventoryService::IsCompleteWeapon(entry) ||
+            std::strcmp(id, "ID_Melee_Temporary") == 0)
+            return Category::CompleteWeapons;
         if (HasAny(id, { "Bandage", "Injector" }))
             return Category::Medical;
         if (HasAny(id, { "Armor", "Helmet", "Rig", "Plate_Carrier", "Back", "Night_Vision", "Goggles" }))
             return Category::ArmorGear;
         if (HasAny(id, { "x19_", "x39_", "x45_", "x51_", "x300_", "x338_", "12x70_", "rnd", "Rnd", "Drum", "Stanag", "Powermag" }))
             return Category::AmmoMags;
-        if (HasAny(id, { "Scope", "Sight", "Flash", "Foregrip", "Suppressor", "Muzzle", "Barrel", "Handguard", "PistolGrip", "Pistol_Grip", "Stock", "Dust_Cover", "Gas_Tube", "Dovetail", "Slide", "Buttstock", "Buffertube", "Shroud" }))
-            return Category::Attachments;
-        if (HasAny(id, { "AK-", "AKS-", "M700", "Glock_19", "QSZ-92", "Simonov_SKS", "MP5SD", "Colt_M4A1", "KRISS_Vector_45ACP", "RIA_VR80", "Melee" }))
-            return Category::Weapons;
+        if (HasAny(id, { "Foregrip", "Suppressor", "Muzzle", "Barrel", "Handguard",
+                         "PistolGrip", "Pistol_Grip", "Stock", "Dust_Cover", "Gas_Tube",
+                         "Dovetail", "Slide", "Buttstock", "Buffertube", "Shroud", "Chassis",
+                         "Front_Sight_With_Gas_Block" }))
+            return Category::GunParts;
+        if (HasAny(id, { "Scope", "Sight", "Flash", "Thermal", "Compass" }))
+            return Category::OpticsAccessories;
         return Category::ResourcesUtility;
     }
 
@@ -184,7 +192,7 @@ namespace Spawner
             {
                 const auto& entry = ItemCatalog::Entries[static_cast<size_t>(i)];
                 if (g_category != static_cast<int>(Category::All) &&
-                    Classify(entry.Id) != static_cast<Category>(g_category))
+                    Classify(entry) != static_cast<Category>(g_category))
                     continue;
                 if (!ContainsInsensitive(entry.Id, g_filter))
                     continue;
@@ -198,6 +206,11 @@ namespace Spawner
         ImGui::Text("Selected: %s", selected.Id);
         ImGui::TextDisabled("Package 0x%X | live IRRItemDefinition 0x%X",
             selected.PackageIndex, selected.DefinitionIndex);
+        if (InventoryService::IsCompleteWeapon(selected))
+            ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.62f, 1.0f),
+                "COMPLETE WEAPON: preset root + default vital parts");
+        else if (Classify(selected) == Category::GunParts)
+            ImGui::TextDisabled("GUN PART: standalone definition (no complete-weapon preset)");
 
         const char* buttonLabel = g_destination == 0 ? "ADD TO INVENTORY" : "ADD TO STASH";
         if (ImGui::Button(buttonLabel, ImVec2(190.0f, 34.0f)))
@@ -237,6 +250,11 @@ namespace Spawner
                 static_cast<unsigned long long>(g_lastResult.ReturnedDefinition),
                 g_lastResult.CanAddBuiltItem ? "YES" : "NO",
                 g_lastResult.TryAddReturned ? "YES" : "NO");
+            ImGui::TextDisabled("Preset: 0x%llX | complete: %s | attachments: %d | records: %d -> %d",
+                static_cast<unsigned long long>(g_lastResult.PresetObject),
+                g_lastResult.CompleteWeapon ? "YES" : "NO",
+                g_lastResult.ExpectedAttachments,
+                g_lastResult.ItemRecordsBefore, g_lastResult.ItemRecordsAfter);
         }
     }
 

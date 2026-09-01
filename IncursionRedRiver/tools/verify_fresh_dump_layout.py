@@ -136,6 +136,7 @@ EXPECTED_INDICES = {
     "Function Test_C.InventoryComponent.SetInfiniteAmmunition": 0x6C9E,
     "Function Test_C.InventoryComponent.GetInfiniteAmmunition": 0x6C55,
     "Function Test_C.InventoryComponent.ToggleInfiniteAmmunition": 0x6CA1,
+    "Function Test_C.IRRItemPreset.GetDefaultItem": 0x6DEE,
     "Function Test_C.IRRBodyComponent.GetBodyPartLocation": 0x6DBF,
     "Function Test_C.IRRBodyComponent.GetEyeLocation": 0x6DC0,
     "Function Test_C.SimpleGameplayAttribute.GetCurrentMaxValue": 0x6EEF,

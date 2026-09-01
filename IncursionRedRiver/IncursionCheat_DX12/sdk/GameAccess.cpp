@@ -1524,7 +1524,9 @@ namespace GameAccess
                     Offsets::FirstPersonStamina_StaminaAttribute);
                 if (IsObjectOfClass(attribute, g_classes.SimpleGameplayAttribute))
                 {
-                    g_staminaAttributes.push_back(attribute);
+                    if (std::find(g_staminaAttributes.begin(), g_staminaAttributes.end(),
+                            attribute) == g_staminaAttributes.end())
+                        g_staminaAttributes.push_back(attribute);
                     if (!g_diag.StaminaObject)
                     {
                         g_diag.StaminaObject = object;
