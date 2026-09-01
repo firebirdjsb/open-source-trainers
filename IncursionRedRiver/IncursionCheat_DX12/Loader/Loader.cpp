@@ -16,8 +16,10 @@ namespace
 {
     constexpr wchar_t DefaultTargetExe[] = L"Test_C-Win64-Shipping.exe";
     constexpr DWORD ProcessPollMilliseconds = 250;
-    constexpr DWORD ReadyTimeoutMilliseconds = 60000;
     constexpr DWORD InjectionTimeoutMilliseconds = 30000;
+    constexpr ULONGLONG FileTimeTicksPerSecond = 10000000ULL;
+    constexpr ULONGLONG LogTimestampToleranceSeconds = 5ULL;
+    constexpr DWORD MaximumLogProbeBytes = 4U * 1024U * 1024U;
 
     class UniqueHandle
     {
@@ -72,8 +74,10 @@ namespace
         std::wstring TargetExe = DefaultTargetExe;
         bool TargetExeExplicit = false;
         bool WaitForGame = true;
+        bool WaitForMainMenu = true;
         unsigned long long TimeoutSeconds = 0; // Zero means no timeout.
-        unsigned long long SettleMilliseconds = 2000;
+        unsigned long long SettleMilliseconds = 5000;
+        fs::path LogPath;
     };
 
     enum class InjectionResult
@@ -225,6 +229,144 @@ namespace
         return IsWow64Process(process, &wow64) && !wow64;
     }
 
+    ULONGLONG FileTimeValue(const FILETIME& time)
+    {
+        ULARGE_INTEGER value{};
+        value.LowPart = time.dwLowDateTime;
+        value.HighPart = time.dwHighDateTime;
+        return value.QuadPart;
+    }
+
+    bool GetProcessCreationTime(HANDLE process, ULONGLONG& creationTime)
+    {
+        FILETIME created{};
+        FILETIME exited{};
+        FILETIME kernel{};
+        FILETIME user{};
+        if (!::GetProcessTimes(process, &created, &exited, &kernel, &user))
+            return false;
+        creationTime = FileTimeValue(created);
+        return creationTime != 0;
+    }
+
+    struct WindowProbe
+    {
+        DWORD ProcessId = 0;
+        HWND Window = nullptr;
+    };
+
+    BOOL CALLBACK FindGameWindow(HWND window, LPARAM parameter)
+    {
+        auto* probe = reinterpret_cast<WindowProbe*>(parameter);
+        if (!probe || !IsWindowVisible(window) || GetWindow(window, GW_OWNER))
+            return TRUE;
+
+        DWORD windowProcessId = 0;
+        GetWindowThreadProcessId(window, &windowProcessId);
+        if (windowProcessId != probe->ProcessId)
+            return TRUE;
+
+        if ((GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0)
+            return TRUE;
+
+        RECT client{};
+        if (!GetClientRect(window, &client) ||
+            client.right - client.left < 640 || client.bottom - client.top < 360)
+            return TRUE;
+
+        probe->Window = window;
+        return FALSE;
+    }
+
+    HWND FindGameWindow(DWORD processId)
+    {
+        WindowProbe probe{};
+        probe.ProcessId = processId;
+        EnumWindows(FindGameWindow, reinterpret_cast<LPARAM>(&probe));
+        return probe.Window;
+    }
+
+    bool IsWindowResponsive(HWND window)
+    {
+        DWORD_PTR result = 0;
+        return window && SendMessageTimeoutW(
+            window, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            250, &result) != 0;
+    }
+
+    fs::path DefaultGameLogPath()
+    {
+        const DWORD required = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+        if (!required)
+            return {};
+
+        std::vector<wchar_t> buffer(static_cast<size_t>(required));
+        const DWORD length = GetEnvironmentVariableW(
+            L"LOCALAPPDATA", buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (!length || length >= buffer.size())
+            return {};
+
+        return fs::path(std::wstring(buffer.data(), length)) /
+            L"Test_C" / L"Saved" / L"Logs" / L"Test_C.log";
+    }
+
+    struct MainMenuLogState
+    {
+        bool Exists = false;
+        bool CurrentSession = false;
+        bool MainMenuLoaded = false;
+    };
+
+    MainMenuLogState ProbeMainMenuLog(const fs::path& path,
+                                      ULONGLONG processCreationTime)
+    {
+        MainMenuLogState state{};
+        if (path.empty())
+            return state;
+
+        UniqueHandle file(CreateFileW(
+            path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (!file)
+            return state;
+        state.Exists = true;
+
+        FILETIME lastWrite{};
+        if (!GetFileTime(file.Get(), nullptr, nullptr, &lastWrite))
+            return state;
+
+        const ULONGLONG logWriteTime = FileTimeValue(lastWrite);
+        const ULONGLONG tolerance =
+            LogTimestampToleranceSeconds * FileTimeTicksPerSecond;
+        if (logWriteTime + tolerance < processCreationTime)
+            return state;
+        state.CurrentSession = true;
+
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(file.Get(), &size) || size.QuadPart <= 0)
+            return state;
+
+        const DWORD bytesToRead = static_cast<DWORD>(
+            size.QuadPart < MaximumLogProbeBytes ? size.QuadPart : MaximumLogProbeBytes);
+        std::vector<char> contents(static_cast<size_t>(bytesToRead));
+        DWORD bytesRead = 0;
+        if (!ReadFile(file.Get(), contents.data(), bytesToRead, &bytesRead, nullptr) ||
+            bytesRead == 0)
+            return state;
+
+        const std::string log(contents.data(), static_cast<size_t>(bytesRead));
+        const bool completedMenuLoad =
+            log.find("UEngine::LoadMap Load map complete /Game/Maps/Gameplay/LVL_Menu") !=
+            std::string::npos;
+        const size_t bringingWorld =
+            log.find("Bringing World /Game/Maps/Gameplay/LVL_Menu");
+        const bool menuBroughtUp = bringingWorld != std::string::npos &&
+            log.find("up for play", bringingWorld) != std::string::npos;
+        state.MainMenuLoaded = completedMenuLoad || menuBroughtUp;
+        return state;
+    }
+
     bool ValidateDllImage(const fs::path& dll)
     {
         std::ifstream input(dll, std::ios::binary);
@@ -359,7 +501,8 @@ namespace
         return 0;
     }
 
-    bool WaitForProcessReady(DWORD processId, const Options& options)
+    bool WaitForProcessReady(DWORD processId, const Options& options,
+                             ULONGLONG overallWaitStarted)
     {
         UniqueHandle process(OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
                                          FALSE, processId));
@@ -374,32 +517,94 @@ namespace
             return false;
         }
 
+        ULONGLONG processCreationTime = 0;
+        if (!GetProcessCreationTime(process.Get(), processCreationTime))
+        {
+            PrintWin32Error(L"GetProcessTimes");
+            return false;
+        }
+
         std::wcout << L"[Wait] Process found (PID " << processId
-                   << L"); waiting for its module loader to become ready...\n";
-        const ULONGLONG started = GetTickCount64();
-        bool modulesReady = false;
-        while (GetTickCount64() - started < ReadyTimeoutMilliseconds)
+                   << L"); waiting for the Unreal main menu before injection...\n";
+
+        bool mainModuleReady = false;
+        bool loaderReady = false;
+        bool dxgiReady = false;
+        bool d3d12Ready = false;
+        bool windowReady = false;
+        MainMenuLogState logState{};
+        ULONGLONG nextLogProbe = 0;
+        ULONGLONG nextStatus = 0;
+
+        while (!TimeoutReached(overallWaitStarted, options.TimeoutSeconds))
         {
             if (WaitForSingleObject(process.Get(), 0) != WAIT_TIMEOUT)
             {
                 std::wcerr << L"[Error] Target exited before injection.\n";
                 return false;
             }
-            const bool mainLoaded = FindRemoteModule(processId, options.TargetExe).Base != 0;
-            const bool loaderReady = FindRemoteModule(processId, L"kernelbase.dll").Base != 0 ||
-                                     FindRemoteModule(processId, L"kernel32.dll").Base != 0;
-            if (mainLoaded && loaderReady)
+
+            if (!mainModuleReady)
+                mainModuleReady = FindRemoteModule(processId, options.TargetExe).Base != 0;
+            if (!loaderReady)
+                loaderReady = FindRemoteModule(processId, L"kernelbase.dll").Base != 0 ||
+                              FindRemoteModule(processId, L"kernel32.dll").Base != 0;
+            if (!dxgiReady)
+                dxgiReady = FindRemoteModule(processId, L"dxgi.dll").Base != 0;
+            if (!d3d12Ready)
+                d3d12Ready = FindRemoteModule(processId, L"d3d12.dll").Base != 0;
+
+            const HWND gameWindow = FindGameWindow(processId);
+            windowReady = IsWindowResponsive(gameWindow);
+
+            const ULONGLONG now = GetTickCount64();
+            if (options.WaitForMainMenu && now >= nextLogProbe)
             {
-                modulesReady = true;
+                logState = ProbeMainMenuLog(options.LogPath, processCreationTime);
+                nextLogProbe = now + 500;
+            }
+
+            const bool menuReady = !options.WaitForMainMenu || logState.MainMenuLoaded;
+            if (mainModuleReady && loaderReady && dxgiReady && d3d12Ready &&
+                windowReady && menuReady)
+            {
                 break;
             }
-            Sleep(100);
+
+            if (now >= nextStatus)
+            {
+                std::wcout
+                    << L"[Wait] Startup status: EXE " << (mainModuleReady ? L"OK" : L"WAIT")
+                    << L" | DXGI " << (dxgiReady ? L"OK" : L"WAIT")
+                    << L" | D3D12 " << (d3d12Ready ? L"OK" : L"WAIT")
+                    << L" | WINDOW " << (windowReady ? L"OK" : L"WAIT");
+                if (options.WaitForMainMenu)
+                {
+                    std::wcout
+                        << L" | LOG " << (logState.CurrentSession ? L"CURRENT" : L"WAIT")
+                        << L" | MAIN MENU " << (logState.MainMenuLoaded ? L"READY" : L"WAIT");
+                }
+                std::wcout << L"\n";
+                nextStatus = now + 5000;
+            }
+            Sleep(ProcessPollMilliseconds);
         }
-        if (!modulesReady)
+
+        if (TimeoutReached(overallWaitStarted, options.TimeoutSeconds))
         {
-            std::wcerr << L"[Error] Timed out waiting for the target module loader.\n";
+            std::wcerr << L"[Error] Timed out before the game reached the main menu.\n";
             return false;
         }
+
+        if (options.WaitForMainMenu)
+            std::wcout << L"[Ready] Current-session main-menu load confirmed in: "
+                       << options.LogPath << L"\n";
+        else
+            std::wcout << L"[Warning] Main-menu wait was explicitly bypassed.\n";
+
+        if (options.SettleMilliseconds)
+            std::wcout << L"[Wait] Renderer and menu are ready; stabilizing for "
+                       << options.SettleMilliseconds / 1000.0 << L" seconds...\n";
 
         const ULONGLONG settleStarted = GetTickCount64();
         while (GetTickCount64() - settleStarted < options.SettleMilliseconds)
@@ -564,7 +769,8 @@ namespace
             << L"Incursion DX12 loader\n\n"
             << L"Usage:\n"
             << L"  " << self << L"\n"
-            << L"      Wait indefinitely for Test_C-Win64-Shipping.exe, then inject.\n\n"
+            << L"      Wait for Test_C-Win64-Shipping.exe and its current-session main menu,\n"
+            << L"      allow the renderer to settle, then inject.\n\n"
             << L"  " << self << L" --timeout 300\n"
             << L"      Wait up to five minutes. Zero means no timeout.\n\n"
             << L"  " << self << L" --game \"C:\\...\\Test_C-Win64-Shipping.exe\"\n"
@@ -572,8 +778,10 @@ namespace
             << L"Options:\n"
             << L"  --dll <path>       Override the DLL beside Loader.exe.\n"
             << L"  --process <name>   Override the target executable name.\n"
+            << L"  --log <path>       Override the Unreal Test_C.log path.\n"
             << L"  --timeout <sec>    Process wait timeout; 0 waits indefinitely.\n"
-            << L"  --delay <sec>      Startup settle delay after modules load (default 2).\n"
+            << L"  --delay <sec>      Stabilization delay after main-menu load (default 5).\n"
+            << L"  --early            UNSAFE: bypass only the main-menu log gate.\n"
             << L"  --no-wait          Fail immediately if the process is absent.\n"
             << L"  --wait             Explicitly enable the default wait behavior.\n"
             << L"  --help, -h         Show this help.\n\n"
@@ -601,14 +809,20 @@ namespace
                 options.WaitForGame = false;
                 continue;
             }
+            if (argument == L"--early")
+            {
+                options.WaitForMainMenu = false;
+                continue;
+            }
 
-            if ((argument == L"--dll" || argument == L"--game" ||
+            if ((argument == L"--dll" || argument == L"--game" || argument == L"--log" ||
                  argument == L"--process" || argument == L"--timeout" ||
                  argument == L"--delay") && i + 1 < argc)
             {
                 const wchar_t* value = argv[++i];
                 if (argument == L"--dll") options.DllPath = value;
                 else if (argument == L"--game") options.GamePath = value;
+                else if (argument == L"--log") options.LogPath = value;
                 else if (argument == L"--process")
                 {
                     options.TargetExe = value;
@@ -651,6 +865,7 @@ int wmain(int argc, wchar_t** argv)
 {
     Options options{};
     options.DllPath = GetSelfDirectory() / L"IncursionCheat_DX12.dll";
+    options.LogPath = DefaultGameLogPath();
 
     bool showHelp = false;
     if (!ParseArguments(argc, argv, options, showHelp))
@@ -669,6 +884,17 @@ int wmain(int argc, wchar_t** argv)
         const std::wstring launchedName = options.GamePath.filename().wstring();
         if (!launchedName.empty())
             options.TargetExe = launchedName;
+    }
+
+    if (options.WaitForMainMenu)
+    {
+        if (options.LogPath.empty())
+        {
+            std::wcerr << L"[Error] LOCALAPPDATA is unavailable; specify Test_C.log with --log.\n";
+            return 2;
+        }
+        options.LogPath = AbsoluteNormalized(options.LogPath);
+        std::wcout << L"[Info] Safe injection gate: " << options.LogPath << L"\n";
     }
 
     options.DllPath = AbsoluteNormalized(options.DllPath);
@@ -701,9 +927,11 @@ int wmain(int argc, wchar_t** argv)
         return 4;
     }
 
-    while (!WaitForProcessReady(processId, options))
+    while (!WaitForProcessReady(processId, options, waitStarted))
     {
         if (!options.WaitForGame || TimeoutReached(waitStarted, options.TimeoutSeconds))
+            return 5;
+        if (IsProcessAlive(processId))
             return 5;
         std::wcout << L"[Wait] Target disappeared during startup; resuming process wait.\n";
         Sleep(ProcessPollMilliseconds);
