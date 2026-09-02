@@ -75,6 +75,8 @@ namespace GameAccess
         int32_t CachedActors = 0;
         int32_t LastRequestedActors = 0;
         int32_t LastSampledActors = 0;
+        int32_t LastAggregateActors = 0;
+        int32_t LastFallbackActors = 0;
         uint64_t LastCompletedAt = 0;
         uint32_t LastSampleThreadId = 0;
         bool TaskPending = false;

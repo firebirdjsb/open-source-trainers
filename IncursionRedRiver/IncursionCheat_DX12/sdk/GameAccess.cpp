@@ -98,10 +98,15 @@ namespace
     struct PoseCacheEntry
     {
         std::array<FVector, 9> Parts{};
+        // Engine-owned output allocation retained and passed back into the next
+        // GetMainBoneLocations call. This bounds allocation to one small buffer per
+        // sampled actor instead of leaking a new reflected TArray every refresh.
+        TArray<FVector> EngineMainBones{};
         FVector ActorLocation{};
         uintptr_t BodyComponent = 0;
         ULONGLONG SampledAt = 0;
         uint16_t ValidMask = 0;
+        bool UsedIndividualFallback = false;
     };
 
     GameAccess::RuntimeDiagnostics g_diag{};
@@ -135,6 +140,8 @@ namespace
     std::atomic<uint32_t> g_poseLastSampleThreadId{ 0 };
     std::atomic<int32_t> g_poseLastRequestedActors{ 0 };
     std::atomic<int32_t> g_poseLastSampledActors{ 0 };
+    std::atomic<int32_t> g_poseLastAggregateActors{ 0 };
+    std::atomic<int32_t> g_poseLastFallbackActors{ 0 };
     std::atomic<ULONGLONG> g_poseLastCompletedAt{ 0 };
     ULONGLONG g_lastPoseRequestAt = 0;
     uintptr_t g_poseCacheWorld = 0;
@@ -177,7 +184,8 @@ namespace
     bool ClassIsChildOf(uintptr_t objectClass, uintptr_t targetClass);
     bool IsObjectOfClass(uintptr_t object, uintptr_t targetClass);
 
-    bool ReadBodyPoseDirect(uintptr_t actor, PoseCacheEntry& out)
+    bool ReadBodyPoseDirect(uintptr_t actor, const PoseCacheEntry* previous,
+                            PoseCacheEntry& out)
     {
         out = {};
         if (!actor || !GameAccess::IsIRRCharacter(actor) ||
@@ -192,11 +200,106 @@ namespace
 
         auto plausible = [&](const FVector& point)
         {
-            return point.IsFinite() && point.Distance(out.ActorLocation) < 500.0;
+            return point.IsFinite() && point.Distance(out.ActorLocation) < 275.0;
         };
 
-        // Head uses the exact eye anchor also used by aim assist. The remaining
-        // entries follow EIRRBodyPart declaration order (Thorax through LeftFoot).
+        // This native function returns all main body anchors in one call. The old
+        // implementation invoked nine separate functions per actor/sample, which
+        // caused the large frame-time spike reported with Skeleton ESP enabled.
+        struct MainBoneParams
+        {
+            TArray<FVector> OutLocations{};
+        } mainParams{};
+        if (previous && previous->EngineMainBones.IsSane(64))
+            mainParams.OutLocations = previous->EngineMainBones;
+        const bool mainCallSucceeded = GameAccess::InvokeFunctionRaw(body,
+                FunctionIndices::IRRBodyComponent_GetMainBoneLocations,
+                &mainParams, sizeof(mainParams));
+        out.EngineMainBones = mainParams.OutLocations;
+        if (mainCallSucceeded)
+        {
+            const auto& locations = mainParams.OutLocations;
+            const uintptr_t data = reinterpret_cast<uintptr_t>(locations.Data);
+            if (locations.IsSane(64) && data && locations.Count >= 5 &&
+                Memory::IsReadable(data, static_cast<size_t>(locations.Count) *
+                    sizeof(FVector)))
+            {
+                const int32_t count = std::min<int32_t>(locations.Count, 9);
+                std::array<FVector, 9> returned{};
+                std::array<bool, 9> returnedValid{};
+                for (int32_t index = 0; index < count; ++index)
+                {
+                    FVector point{};
+                    if (!Memory::TryRead(data + static_cast<uintptr_t>(index) *
+                            sizeof(FVector), point) || !plausible(point))
+                        continue;
+                    returned[static_cast<size_t>(index)] = point;
+                    returnedValid[static_cast<size_t>(index)] = true;
+                }
+
+                // TMap-backed native output order is not assumed. After the first
+                // individually-labelled sample, associate aggregate points with the
+                // same actor's previous roles by nearest translated position. This
+                // keeps left/right limbs and their parent links bound to one enemy.
+                if (previous && previous->ValidMask)
+                {
+                    const FVector actorDelta = out.ActorLocation -
+                        previous->ActorLocation;
+                    std::array<bool, 9> used{};
+                    for (int32_t role = 0; role < 9; ++role)
+                    {
+                        if ((previous->ValidMask &
+                                static_cast<uint16_t>(1u << role)) == 0)
+                            continue;
+                        const FVector expected = previous->Parts[
+                            static_cast<size_t>(role)] + actorDelta;
+                        int32_t bestIndex = -1;
+                        double bestDistance = std::numeric_limits<double>::max();
+                        for (int32_t index = 0; index < count; ++index)
+                        {
+                            if (used[static_cast<size_t>(index)] ||
+                                !returnedValid[static_cast<size_t>(index)])
+                                continue;
+                            const double distance = expected.Distance(
+                                returned[static_cast<size_t>(index)]);
+                            if (distance < bestDistance)
+                            {
+                                bestDistance = distance;
+                                bestIndex = index;
+                            }
+                        }
+                        if (bestIndex < 0 || bestDistance > 175.0)
+                            continue;
+                        used[static_cast<size_t>(bestIndex)] = true;
+                        out.Parts[static_cast<size_t>(role)] = returned[
+                            static_cast<size_t>(bestIndex)];
+                        out.ValidMask |= static_cast<uint16_t>(1u << role);
+                    }
+                }
+                out.SampledAt = GetTickCount64();
+                double minZ = std::numeric_limits<double>::max();
+                double maxZ = -std::numeric_limits<double>::max();
+                for (int32_t index = 0; index < count; ++index)
+                {
+                    if ((out.ValidMask & static_cast<uint16_t>(1u << index)) == 0)
+                        continue;
+                    minZ = std::min(minZ, out.Parts[static_cast<size_t>(index)].Z);
+                    maxZ = std::max(maxZ, out.Parts[static_cast<size_t>(index)].Z);
+                }
+                const double heightSpan = maxZ - minZ;
+                if ((out.ValidMask & 0x007u) == 0x007u &&
+                    (out.ValidMask & 0x1F8u) != 0 &&
+                    std::isfinite(heightSpan) && heightSpan > 40.0 &&
+                    heightSpan < 300.0)
+                    return true;
+            }
+        }
+
+        // Compatibility path for a build where the aggregate function is absent or
+        // returns a different layout. It is only reached after the single-call path
+        // fails validation.
+        out.ValidMask = 0;
+        out.UsedIndividualFallback = true;
         alignas(8) uint8_t eyeParams[0x18]{};
         if (GameAccess::InvokeFunctionRaw(body,
                 FunctionIndices::IRRBodyComponent_GetEyeLocation,
@@ -1235,6 +1338,8 @@ namespace GameAccess
         g_poseLastSampleThreadId.store(0);
         g_poseLastRequestedActors.store(0);
         g_poseLastSampledActors.store(0);
+        g_poseLastAggregateActors.store(0);
+        g_poseLastFallbackActors.store(0);
         g_poseLastCompletedAt.store(0);
         g_lastPoseRequestAt = 0;
         g_isAResultCache.clear();
@@ -1689,6 +1794,8 @@ namespace GameAccess
         }
         out.LastRequestedActors = g_poseLastRequestedActors.load();
         out.LastSampledActors = g_poseLastSampledActors.load();
+        out.LastAggregateActors = g_poseLastAggregateActors.load();
+        out.LastFallbackActors = g_poseLastFallbackActors.load();
         out.LastCompletedAt = g_poseLastCompletedAt.load();
         out.LastSampleThreadId = g_poseLastSampleThreadId.load();
         out.TaskPending = g_poseTaskPending.load();
@@ -1911,9 +2018,13 @@ namespace GameAccess
                     return false;
                 cached = found->second;
             }
+            if (Memory::Read<uintptr_t>(actor +
+                    Offsets::IRRBaseCharacter_BodyComponent) != cached.BodyComponent)
+                return false;
             FVector currentLocation{};
-            const FVector delta = GetActorLocation(actor, currentLocation) ?
-                currentLocation - cached.ActorLocation : FVector{};
+            if (!GetActorLocation(actor, currentLocation))
+                return false;
+            const FVector delta = currentLocation - cached.ActorLocation;
             if (outBodyComponent)
                 *outBodyComponent = cached.BodyComponent;
             return PoseTargetFromEntry(cached, targetName, delta, outLocation);
@@ -2050,14 +2161,51 @@ namespace GameAccess
             {
                 std::vector<std::pair<uintptr_t, PoseCacheEntry>> completed;
                 completed.reserve(requested.size());
+                int32_t expensiveSamples = 0;
                 for (const uintptr_t actor : requested)
                 {
+                    PoseCacheEntry previous{};
+                    bool hasPrevious = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_poseCacheMutex);
+                        const auto found = g_poseCache.find(actor);
+                        if (found != g_poseCache.end())
+                        {
+                            previous = found->second;
+                            hasPrevious = true;
+                        }
+                    }
+                    if (hasPrevious && previous.UsedIndividualFallback &&
+                        previous.SampledAt &&
+                        GetTickCount64() - previous.SampledAt < 250)
+                    {
+                        std::lock_guard<std::mutex> lock(g_poseCacheMutex);
+                        if (g_poseCacheWorld == world)
+                            g_poseQueuedActors.insert(actor);
+                        continue;
+                    }
+                    const bool mayNeedIndividualCalls = !hasPrevious ||
+                        previous.UsedIndividualFallback;
+                    if (mayNeedIndividualCalls && expensiveSamples >= 2)
+                    {
+                        std::lock_guard<std::mutex> lock(g_poseCacheMutex);
+                        if (g_poseCacheWorld == world)
+                            g_poseQueuedActors.insert(actor);
+                        continue;
+                    }
+                    if (mayNeedIndividualCalls)
+                        ++expensiveSamples;
                     PoseCacheEntry sample{};
-                    if (ReadBodyPoseDirect(actor, sample))
+                    if (ReadBodyPoseDirect(actor,
+                            hasPrevious ? &previous : nullptr, sample))
                         completed.emplace_back(actor, sample);
                 }
 
                 const ULONGLONG completedAt = GetTickCount64();
+                int32_t fallbackCount = 0;
+                for (const auto& item : completed)
+                    if (item.second.UsedIndividualFallback)
+                        ++fallbackCount;
                 {
                     std::lock_guard<std::mutex> lock(g_poseCacheMutex);
                     if (g_poseCacheWorld == world)
@@ -2075,6 +2223,9 @@ namespace GameAccess
                     }
                 }
                 g_poseLastSampledActors.store(static_cast<int32_t>(completed.size()));
+                g_poseLastFallbackActors.store(fallbackCount);
+                g_poseLastAggregateActors.store(
+                    static_cast<int32_t>(completed.size()) - fallbackCount);
                 g_poseLastSampleThreadId.store(GetCurrentThreadId());
                 g_poseLastCompletedAt.store(completedAt);
                 g_poseTaskPending.store(false);
@@ -2099,13 +2250,20 @@ namespace GameAccess
             cached = found->second;
         }
 
+        if (Memory::Read<uintptr_t>(actor +
+                Offsets::IRRBaseCharacter_BodyComponent) != cached.BodyComponent)
+            return {};
+
         FVector currentLocation{};
-        const FVector delta = GetActorLocation(actor, currentLocation) ?
-            currentLocation - cached.ActorLocation : FVector{};
-        // Head, thorax, stomach, right/left arm, right/left leg, right/left foot.
-        constexpr std::array<int32_t, 9> parents = { 1, 2, -1, 1, 1, 2, 2, 5, 6 };
+        if (!GetActorLocation(actor, currentLocation))
+            return {};
+        const FVector delta = currentLocation - cached.ActorLocation;
+        // Head, thorax, stomach, right/left arm, right/left leg, right/left foot,
+        // followed by synthetic neck and pelvis joints. The synthetic joints only
+        // connect exact sampled anchors; they do not invent detached world points.
+        constexpr std::array<int32_t, 9> parents = { 9, 2, 10, 1, 1, 10, 10, 5, 6 };
         std::vector<BonePoint> points;
-        points.reserve(9);
+        points.reserve(11);
         for (int32_t index = 0; index < 9; ++index)
         {
             if ((cached.ValidMask & static_cast<uint16_t>(1u << index)) == 0)
@@ -2115,6 +2273,23 @@ namespace GameAccess
                 continue;
             points.push_back({ index, parents[static_cast<size_t>(index)],
                                worldPoint - currentLocation, worldPoint });
+        }
+        FVector head{}, thorax{}, stomach{}, rightLeg{}, leftLeg{};
+        const bool haveHead = PoseTargetFromEntry(cached, "head", delta, head);
+        const bool haveThorax = PoseTargetFromEntry(cached, "chest", delta, thorax);
+        const bool haveStomach = PoseTargetFromEntry(cached, "stomach", delta, stomach);
+        const bool haveRightLeg = PoseTargetFromEntry(cached, "leg_r", delta, rightLeg);
+        const bool haveLeftLeg = PoseTargetFromEntry(cached, "leg_l", delta, leftLeg);
+        if (haveHead && haveThorax)
+        {
+            const FVector neck = thorax + (head - thorax) * 0.68;
+            points.push_back({ 9, 1, neck - currentLocation, neck });
+        }
+        if (haveStomach && haveRightLeg && haveLeftLeg)
+        {
+            const FVector hipCenter = (rightLeg + leftLeg) * 0.5;
+            const FVector pelvis = stomach + (hipCenter - stomach) * 0.42;
+            points.push_back({ 10, -1, pelvis - currentLocation, pelvis });
         }
         return points;
     }

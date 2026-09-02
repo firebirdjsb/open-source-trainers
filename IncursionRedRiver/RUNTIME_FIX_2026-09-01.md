@@ -16,6 +16,8 @@ This build preserves the working DX12 renderer, command queue hook, menu input c
 - If parent topology cannot be verified, an anatomical chain is constructed from the real cached transform points rather than guessed world offsets.
 - Living AI use `SkeletalMeshComponentBudgeted`; its base component-space array can remain empty until ragdoll/death. Bone ESP now falls back to the authoritative `IRRBodyComponent` eye, thorax, stomach, arm, leg, and foot locations.
 - Those pose functions are sampled in bounded batches on the window/game thread and cached for the render thread. Actor-location delta compensation keeps cached limbs attached between samples.
+- The optimized fallback uses one `GetMainBoneLocations` call per visible enemy instead of nine separate reflected calls. Its small engine output buffer is reused, off-screen actors are excluded, and the slower compatibility/first-label path is capped at 4 Hz and two actors per pass to prevent initialization hitches.
+- Cached poses are bound to the actor's current `BodyComponent` and require a live actor-root location before rendering. Synthetic neck/pelvis joints connect only the validated game-provided anchors.
 
 ## Aimbot visibility
 - `Controller::LineOfSightTo` no longer runs from the DX12 Present path. Up to eight shortlisted targets are sampled on the window/game thread and consumed through a 250 ms cache.

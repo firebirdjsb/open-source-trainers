@@ -168,8 +168,10 @@ namespace
             ImGui::Text("CachedTransforms: %d / %d | validation: %s",
                 b.TransformCount, b.TransformCapacity,
                 b.TransformArrayValid ? "OK" : "FAILED");
-            ImGui::Text("Budgeted live-pose cache: %d actors | last %d/%d | %s | thread %lu",
+            ImGui::Text("Budgeted pose: %d cached | last %d/%d | aggregate %d | fallback %d",
                 pose.CachedActors, pose.LastSampledActors, pose.LastRequestedActors,
+                pose.LastAggregateActors, pose.LastFallbackActors);
+            ImGui::Text("Pose task: %s | thread %lu",
                 pose.TaskPending ? "SAMPLING" : "READY",
                 static_cast<unsigned long>(pose.LastSampleThreadId));
             Address("reference parent array", b.ParentArray);

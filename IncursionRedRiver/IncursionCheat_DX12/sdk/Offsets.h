@@ -297,4 +297,5 @@ namespace FunctionIndices
     constexpr int32_t IRRItemPreset_GetDefaultItem = 0x6DEE;
     constexpr int32_t IRRBodyComponent_GetBodyPartLocation = 0x6DBF;
     constexpr int32_t IRRBodyComponent_GetEyeLocation = 0x6DC0;
+    constexpr int32_t IRRBodyComponent_GetMainBoneLocations = 0x6DC1;
 }

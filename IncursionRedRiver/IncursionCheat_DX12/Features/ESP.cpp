@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -106,6 +107,8 @@ namespace
         std::vector<ProjectedBone> projected(bones.size());
         std::unordered_map<int32_t, size_t> byIndex;
         int visiblePoints = 0;
+        float minScreenY = std::numeric_limits<float>::max();
+        float maxScreenY = -std::numeric_limits<float>::max();
         for (size_t i = 0; i < bones.size(); ++i)
         {
             byIndex[bones[i].Index] = i;
@@ -113,7 +116,11 @@ namespace
                 bones[i].World, projected[i].Screen,
                 camera.Location, camera.Rotation, camera.FOV, width, height);
             if (projected[i].Visible)
+            {
                 ++visiblePoints;
+                minScreenY = std::min(minScreenY, projected[i].Screen.y);
+                maxScreenY = std::max(maxScreenY, projected[i].Screen.y);
+            }
         }
         if (visiblePoints < 2)
             return;
@@ -121,6 +128,9 @@ namespace
         ++g_lastSkeletonActors;
         g_lastSkeletonPoints += visiblePoints;
         const ImU32 boneColor = IM_COL32(255, 205, 80, 225);
+        const float projectedHeight = std::max(0.0f, maxScreenY - minScreenY);
+        const float lineThickness = std::clamp(
+            1.35f + projectedHeight / 180.0f, 1.35f, 2.35f);
 
         // Prefer the verified native reference-skeleton parent topology. If Dumper-7
         // cannot prove that native array for a particular mesh, fall back to an
@@ -136,8 +146,24 @@ namespace
             {
                 Renderer::DrawLine(projected[i].Screen.x, projected[i].Screen.y,
                                    projected[parent->second].Screen.x,
-                                   projected[parent->second].Screen.y, boneColor, 1.25f);
+                                   projected[parent->second].Screen.y, boneColor,
+                                   lineThickness);
                 ++parentEdges;
+            }
+        }
+
+        // The optimized IRR pose fallback adds neck/pelvis indices 9/10. Mark its
+        // exact eye/head anchor so distant skeletons still read as attached figures
+        // rather than a few ambiguous arrow-shaped lines.
+        if ((byIndex.find(9) != byIndex.end() || byIndex.find(10) != byIndex.end()))
+        {
+            const auto head = byIndex.find(0);
+            if (head != byIndex.end() && projected[head->second].Visible)
+            {
+                const float radius = std::clamp(projectedHeight * 0.045f, 1.8f, 4.5f);
+                Renderer::DrawCircle(projected[head->second].Screen.x,
+                                     projected[head->second].Screen.y,
+                                     radius, boneColor);
             }
         }
 
@@ -224,7 +250,7 @@ namespace
                                        projected[static_cast<size_t>(a)].Screen.y,
                                        projected[static_cast<size_t>(b)].Screen.x,
                                        projected[static_cast<size_t>(b)].Screen.y,
-                                       boneColor, 1.35f);
+                                       boneColor, lineThickness);
                 };
                 line(head, neck);
                 line(neck, chest);
@@ -333,8 +359,15 @@ namespace ESP
             {
                 if (candidate.DistanceMeters > skeletonDistanceMeters)
                     break;
+                Vector2 actorScreen{};
+                if (!WorldToScreen::Convert(candidate.Location, actorScreen,
+                        camera.Location, camera.Rotation, camera.FOV, width, height) ||
+                    actorScreen.x < -100.0f || actorScreen.x > display.x + 100.0f ||
+                    actorScreen.y < -100.0f || actorScreen.y > display.y + 100.0f)
+                    continue;
                 poseActors.push_back(candidate.Actor);
-                if (poseActors.size() >= 16)
+                if (poseActors.size() >= static_cast<size_t>(
+                        std::clamp(maxActors, 1, 16)))
                     break;
             }
             GameAccess::RequestPoseSamples(poseActors, 75);
@@ -452,8 +485,10 @@ namespace ESP
             const auto pose = GameAccess::GetPoseCacheDiagnostics();
             ImGui::Text("Bone cache: %d actors / %d points (independent)",
                 d.ValidatedBoneActorCount, d.ValidatedBonePointCount);
-            ImGui::Text("Live pose fallback: %d cached | last %d/%d | %s | thread %lu",
+            ImGui::Text("Live pose cache: %d | last %d/%d | aggregate %d | fallback %d",
                 pose.CachedActors, pose.LastSampledActors, pose.LastRequestedActors,
+                pose.LastAggregateActors, pose.LastFallbackActors);
+            ImGui::Text("Pose task: %s | game thread %lu",
                 pose.TaskPending ? "SAMPLING" : "READY",
                 static_cast<unsigned long>(pose.LastSampleThreadId));
             ImGui::Text("Projected this frame: %d actors / %d visible points",

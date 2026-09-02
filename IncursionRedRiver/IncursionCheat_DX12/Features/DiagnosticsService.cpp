@@ -209,7 +209,10 @@ namespace DiagnosticsService
             << " | mesh type valid: " << YesNo(b.MeshTypeValid) << "\n";
         out << "Budgeted live-pose cache: actors=" << pose.CachedActors
             << " sampled/requested=" << pose.LastSampledActors << '/'
-            << pose.LastRequestedActors << " pending=" << YesNo(pose.TaskPending)
+            << pose.LastRequestedActors
+            << " aggregate=" << pose.LastAggregateActors
+            << " fallback=" << pose.LastFallbackActors
+            << " pending=" << YesNo(pose.TaskPending)
             << " sampleThread=" << pose.LastSampleThreadId
             << " lastCompletedTick=" << pose.LastCompletedAt << "\n";
         Hex(out, "Parent array", b.ParentArray);
