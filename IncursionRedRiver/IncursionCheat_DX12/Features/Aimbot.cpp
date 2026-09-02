@@ -4,18 +4,14 @@
 #include "../Menu.h"
 #include "../sdk/GameAccess.h"
 #include "../sdk/Offsets.h"
-#include "../hooks/PresentHook.h"
 #include "../utils/Renderer.h"
 #include "../utils/WorldToScreen.h"
 #include "../imgui/imgui.h"
 
 #include <Windows.h>
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <limits>
-#include <mutex>
-#include <unordered_map>
 #include <vector>
 
 namespace
@@ -23,21 +19,6 @@ namespace
     constexpr double Pi = 3.14159265358979323846;
     Aimbot::Diagnostics g_aimDiagnostics{};
     uintptr_t g_lockedActor = 0;
-    bool g_activationWasHeld = false;
-
-    struct VisibilitySample
-    {
-        bool Visible = false;
-        bool UsedTargetSphere = false;
-        ULONGLONG SampledAt = 0;
-    };
-
-    std::unordered_map<uintptr_t, VisibilitySample> g_visibilityCache;
-    std::mutex g_visibilityMutex;
-    std::atomic<bool> g_visibilityTaskPending{ false };
-    std::atomic<uint32_t> g_visibilitySampleThreadId{ 0 };
-    ULONGLONG g_lastVisibilityRequestAt = 0;
-    uintptr_t g_visibilityWorld = 0;
 
     struct AimCandidate
     {
@@ -115,103 +96,6 @@ namespace
         return out.IsFinite();
     }
 
-    bool QueueVisibilitySamples(const std::vector<AimCandidate>& candidates)
-    {
-        if (candidates.empty() || !GetGameWindowThreadId())
-            return false;
-        const uintptr_t world = GameAccess::GetWorld();
-        {
-            std::lock_guard<std::mutex> lock(g_visibilityMutex);
-            if (g_visibilityWorld != world)
-            {
-                g_visibilityCache.clear();
-                g_visibilityWorld = world;
-            }
-        }
-
-        const ULONGLONG now = GetTickCount64();
-        if (g_visibilityTaskPending.load() ||
-            (g_lastVisibilityRequestAt && now - g_lastVisibilityRequestAt < 45))
-            return false;
-
-        std::vector<std::pair<uintptr_t, FVector>> targets;
-        targets.reserve(std::min<size_t>(candidates.size(), 8));
-        for (const AimCandidate& candidate : candidates)
-        {
-            if (!candidate.Actor ||
-                !candidate.Target.IsFinite() ||
-                std::find_if(targets.begin(), targets.end(),
-                    [&](const auto& target)
-                    { return target.first == candidate.Actor; }) != targets.end())
-                continue;
-            targets.push_back({ candidate.Actor, candidate.Target });
-            if (targets.size() >= 8)
-                break;
-        }
-        if (targets.empty())
-            return false;
-
-        const int queuedCount = static_cast<int>(targets.size());
-        g_lastVisibilityRequestAt = now;
-        g_visibilityTaskPending.store(true);
-        if (!QueueGameThreadTask([targets = std::move(targets), world]()
-            {
-                std::vector<std::pair<uintptr_t, VisibilitySample>> samples;
-                samples.reserve(targets.size());
-                for (const auto& target : targets)
-                {
-                    const uintptr_t actor = target.first;
-                    if (!GameAccess::IsIRRCharacter(actor))
-                        continue;
-                    bool visible = false;
-                    bool usedTargetSphere = false;
-                    if (GameAccess::HasLineOfSight(actor, target.second, visible,
-                                                  &usedTargetSphere))
-                        samples.push_back({ actor, { visible, usedTargetSphere,
-                                                    GetTickCount64() } });
-                }
-                const ULONGLONG now = GetTickCount64();
-                {
-                    std::lock_guard<std::mutex> lock(g_visibilityMutex);
-                    if (g_visibilityWorld == world)
-                    {
-                        for (const auto& sample : samples)
-                            g_visibilityCache[sample.first] = sample.second;
-                        for (auto it = g_visibilityCache.begin();
-                             it != g_visibilityCache.end();)
-                        {
-                            if (!it->second.SampledAt || now - it->second.SampledAt > 1000)
-                                it = g_visibilityCache.erase(it);
-                            else
-                                ++it;
-                        }
-                    }
-                }
-                g_visibilitySampleThreadId.store(GetCurrentThreadId());
-                g_visibilityTaskPending.store(false);
-            }, false))
-        {
-            g_visibilityTaskPending.store(false);
-            return false;
-        }
-        g_aimDiagnostics.VisibilityQueriesQueued = queuedCount;
-        return true;
-    }
-
-    bool GetCachedVisibility(uintptr_t actor, bool& visible,
-                             bool& usedTargetSphere)
-    {
-        visible = false;
-        usedTargetSphere = false;
-        std::lock_guard<std::mutex> lock(g_visibilityMutex);
-        const auto found = g_visibilityCache.find(actor);
-        if (found == g_visibilityCache.end() || !found->second.SampledAt ||
-            GetTickCount64() - found->second.SampledAt > 250)
-            return false;
-        visible = found->second.Visible;
-        usedTargetSphere = found->second.UsedTargetSphere;
-        return true;
-    }
 }
 
 namespace Aimbot
@@ -220,7 +104,6 @@ namespace Aimbot
     bool bDrawFov = true;
     bool bSmoothAim = true;
     bool bUseMouseInput = true;
-    bool bVisibilityCheck = true;
     bool bAimOnFire = true;
     bool bPrediction = true;
     float smoothAmount = 6.0f;
@@ -253,9 +136,6 @@ namespace Aimbot
         g_aimDiagnostics = {};
         g_aimDiagnostics.RotationObserved = observed;
         g_aimDiagnostics.RotationChangedAfterAttempt = rotationChanged;
-        g_aimDiagnostics.VisibilityTaskPending = g_visibilityTaskPending.load();
-        g_aimDiagnostics.VisibilitySampleThreadId = g_visibilitySampleThreadId.load();
-
         if (!ImGui::GetCurrentContext())
             return;
 
@@ -271,14 +151,12 @@ namespace Aimbot
         if (Menu::bOpen)
         {
             g_lockedActor = 0;
-            g_activationWasHeld = false;
             return;
         }
 
         if (!bEnabled)
         {
             g_lockedActor = 0;
-            g_activationWasHeld = false;
             return;
         }
 
@@ -288,20 +166,12 @@ namespace Aimbot
         if (!controller || !localPawn || !camera.Valid)
             return;
         g_aimDiagnostics.Controller = controller;
-        g_aimDiagnostics.VisibilityRequired = bVisibilityCheck;
         g_aimDiagnostics.RmbHeld = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
         g_aimDiagnostics.LmbHeld = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
         g_aimDiagnostics.ActivationHeld = g_aimDiagnostics.RmbHeld ||
             (bAimOnFire && g_aimDiagnostics.LmbHeld);
-        if (g_aimDiagnostics.ActivationHeld && !g_activationWasHeld)
-        {
-            std::lock_guard<std::mutex> lock(g_visibilityMutex);
-            g_visibilityCache.clear();
-            g_lastVisibilityRequestAt = 0;
-        }
         if (!g_aimDiagnostics.ActivationHeld)
             g_lockedActor = 0;
-        g_activationWasHeld = g_aimDiagnostics.ActivationHeld;
 
         FVector localPos{};
         if (!GameAccess::GetActorLocation(localPawn, localPos))
@@ -329,11 +199,16 @@ namespace Aimbot
 
             FVector target{};
             bool usedCapsuleFallback = false;
-            // Prefer the exact cached, runtime-validated position used by Bone ESP. The
-            // current build reports an empty bone cache, so a capsule-relative position
-            // keeps target acquisition operational while skeletal validation is repaired.
-            if (GameAccess::GetVerifiedBoneTarget(actor, selectedBone, target))
-                ++g_aimDiagnostics.VerifiedBoneTargets;
+            bool usedPoseAwareTarget = false;
+            uintptr_t targetBodyComponent = 0;
+            // Prefer the exact cached, runtime-validated body position. A capsule-relative
+            // point keeps target acquisition operational while that live sample warms up.
+            if (GameAccess::GetPoseAwareBodyTarget(actor, selectedBone, target,
+                                                   &targetBodyComponent))
+            {
+                ++g_aimDiagnostics.LiveBodyTargets;
+                usedPoseAwareTarget = true;
+            }
             else
             {
                 if (!GetCapsuleTarget(actor, selectedBone, target))
@@ -364,7 +239,8 @@ namespace Aimbot
                 fovRadius + 120.0f : fovRadius;
             if (screenDistance <= coarseRadius)
                 candidates.push_back({ actor, target, screen, screenDistance,
-                                       usedCapsuleFallback, false, 0 });
+                                       usedCapsuleFallback, usedPoseAwareTarget,
+                                       targetBodyComponent });
         }
 
         if (candidates.empty())
@@ -443,33 +319,6 @@ namespace Aimbot
             }
         }
 
-        if (bVisibilityCheck && g_aimDiagnostics.ActivationHeld)
-            QueueVisibilitySamples(candidates);
-
-        auto visible = [&](const AimCandidate& candidate) -> bool
-        {
-            if (!bVisibilityCheck || !g_aimDiagnostics.ActivationHeld)
-                return true;
-            bool lineOfSight = false;
-            bool usedTargetSphere = false;
-            if (!GetCachedVisibility(candidate.Actor, lineOfSight,
-                                     usedTargetSphere))
-            {
-                ++g_aimDiagnostics.VisibilityCacheMisses;
-                return false;
-            }
-            ++g_aimDiagnostics.VisibilityCacheHits;
-            ++g_aimDiagnostics.LineOfSightChecks;
-            if (lineOfSight && usedTargetSphere)
-                ++g_aimDiagnostics.TargetSpherePasses;
-            if (!lineOfSight)
-            {
-                ++g_aimDiagnostics.OccludedTargets;
-                return false;
-            }
-            return true;
-        };
-
         const AimCandidate* best = nullptr;
         const AimCandidate* locked = nullptr;
         if (g_lockedActor && g_aimDiagnostics.ActivationHeld)
@@ -477,7 +326,7 @@ namespace Aimbot
             const auto foundLock = std::find_if(candidates.begin(), candidates.end(),
                 [](const AimCandidate& candidate)
                 { return candidate.Actor == g_lockedActor; });
-            if (foundLock != candidates.end() && visible(*foundLock))
+            if (foundLock != candidates.end())
                 locked = &*foundLock;
         }
 
@@ -485,11 +334,8 @@ namespace Aimbot
         {
             if (locked && candidate.Actor == locked->Actor)
                 continue;
-            if (visible(candidate))
-            {
-                best = &candidate;
-                break;
-            }
+            best = &candidate;
+            break;
         }
         if (locked)
         {
@@ -513,7 +359,7 @@ namespace Aimbot
         if (g_aimDiagnostics.ActivationHeld)
             g_lockedActor = chosen.Actor;
 
-        // When the verified skeleton cache is unavailable, the selected head target
+        // When the verified body-point cache is unavailable, the selected head target
         // is refined once through the actor's real eye viewpoint. This avoids aiming
         // at an approximate capsule percentage without adding a call for every actor.
         if (!chosen.PoseAware && chosen.CapsuleFallback && selectedBone == "head" &&
@@ -563,8 +409,6 @@ namespace Aimbot
         g_aimDiagnostics.UsedCapsuleFallback = chosen.CapsuleFallback;
         g_aimDiagnostics.UsedPoseAwareBodyPart = chosen.PoseAware;
         g_aimDiagnostics.TargetBodyComponent = chosen.BodyComponent;
-        g_aimDiagnostics.TargetVisible = !bVisibilityCheck ||
-            !g_aimDiagnostics.ActivationHeld || best != nullptr;
 
         // Gold marker confirms that a target was acquired and shows the exact aim point.
         Renderer::DrawCircle(chosen.Screen.x, chosen.Screen.y, 7.0f,
@@ -623,7 +467,6 @@ namespace Aimbot
             ImGui::SliderFloat("Aim Strength", &aimStrength, 0.10f, 2.50f, "%.2f");
 
         ImGui::Checkbox("Aim while firing (LMB)", &bAimOnFire);
-        ImGui::Checkbox("Wall / visibility check", &bVisibilityCheck);
         ImGui::Checkbox("Projectile movement prediction", &bPrediction);
         if (bPrediction)
         {
@@ -639,7 +482,7 @@ namespace Aimbot
             if (ImGui::RadioButton(bone.c_str(), selectedBone == bone))
                 selectedBone = bone;
         }
-        ImGui::TextWrapped("Hold RMB to aim, or fire with LMB when Aim while firing is enabled. Both inputs use the selected live-pose body point and the same FOV limit. The visibility path first uses the controller's current game-thread viewpoint, then checks a small sphere around the selected point to handle exposed targets at low cover.");
+        ImGui::TextWrapped("Hold RMB to aim, or fire with LMB when Aim while firing is enabled. Both inputs use the selected live-pose body point and the same FOV limit. Targets are selected strictly by crosshair distance with no additional acquisition gate.");
         ImGui::TextWrapped("With smoothing enabled, Mouse Input Aim follows normal game input. With smoothing disabled, the exact dump-validated SetControlRotation path is used automatically so a sensitivity-dependent mouse delta cannot overshoot the target.");
         ImGui::TextWrapped("Targets must be present in the validated local IRRTeamComponent Hostiles array; unknown/neutral IRR candidates are never selected.");
         ImGui::Text("Scan %d | hostile %d | living %d | range %d | projected %d | FOV %d",
@@ -650,13 +493,11 @@ namespace Aimbot
             g_aimDiagnostics.TargetFound ?
                 (g_aimDiagnostics.UsedPoseAwareBodyPart ? "POSE-AWARE BODY PART" :
                  (g_aimDiagnostics.UsedCapsuleFallback ? "CAPSULE FALLBACK" :
-                  "VERIFIED BONE")) : "NONE",
+                  "LIVE BODY POINT")) : "NONE",
             g_aimDiagnostics.PoseAwareTargets,
             g_aimDiagnostics.PoseAwareFailures);
-        ImGui::Text("LOS checks %d | sphere passes %d | occluded %d | visible %s | sticky %s",
-            g_aimDiagnostics.LineOfSightChecks, g_aimDiagnostics.TargetSpherePasses,
-            g_aimDiagnostics.OccludedTargets,
-            g_aimDiagnostics.TargetVisible ? "YES" : "NO",
+        ImGui::Text("Target lock: %s | sticky %s",
+            g_aimDiagnostics.TargetFound ? "ACQUIRED" : "WAIT",
             g_aimDiagnostics.StickyTarget ? "YES" : "NO");
         ImGui::Text("Prediction %s | solver %s | flight %.3f s | projectile %.1f m/s",
             g_aimDiagnostics.PredictionApplied ? "ON" : "WAIT",

@@ -194,59 +194,6 @@ namespace DiagnosticsService
             << " tryAdd=" << YesNo(inventoryResult.TryAddReturned) << "\n";
         out << "Last insertion message: " << inventoryResult.Message << "\n";
 
-        out << "\n=== SKELETAL / BONE CACHE ===\n";
-        const auto& b = GameAccess::GetBoneDiagnostics();
-        const auto pose = GameAccess::GetPoseCacheDiagnostics();
-        out << "Validated independent bones: actors=" << d.ValidatedBoneActorCount
-            << " points=" << d.ValidatedBonePointCount << "\n";
-        Hex(out, "Diagnosed actor", b.Actor);
-        Hex(out, "Character Mesh", b.Mesh);
-        Hex(out, "SkinnedAsset", b.SkinnedAsset);
-        Hex(out, "Skeleton", b.Skeleton);
-        Hex(out, "Cached transform data", b.TransformData);
-        out << "Transforms: " << b.TransformCount << '/' << b.TransformCapacity
-            << " | array valid: " << YesNo(b.TransformArrayValid)
-            << " | mesh type valid: " << YesNo(b.MeshTypeValid) << "\n";
-        out << "Budgeted live-pose cache: actors=" << pose.CachedActors
-            << " sampled/requested=" << pose.LastSampledActors << '/'
-            << pose.LastRequestedActors
-            << " aggregate=" << pose.LastAggregateActors
-            << " fallback=" << pose.LastFallbackActors
-            << " pending=" << YesNo(pose.TaskPending)
-            << " sampleThread=" << pose.LastSampleThreadId
-            << " lastCompletedTick=" << pose.LastCompletedAt << "\n";
-        Hex(out, "Parent array", b.ParentArray);
-        out << "Parents: count=" << b.ParentCount << " stride=0x" << std::hex
-            << b.ParentInfoStride << " field=+0x" << b.ParentFieldOffset << std::dec
-            << " | valid: " << YesNo(b.ParentIndicesValid) << "\n";
-        for (int32_t i = 0; i < b.SampleCount; ++i)
-            out << "Transform sample " << i << ": " << b.SampleTranslations[i].X << ", "
-                << b.SampleTranslations[i].Y << ", " << b.SampleTranslations[i].Z << "\n";
-
-        out << "\n=== ACTIVE CHARACTERS / PER-ACTOR BONES ===\n";
-        int dumped = 0;
-        for (const uintptr_t actor : GameAccess::GetCharacters())
-        {
-            if (!actor || dumped >= 64)
-                break;
-            FVector location{};
-            const bool locationOk = GameAccess::GetActorLocation(actor, location);
-            const bool enemy = GameAccess::IsEnemyCharacter(actor);
-            const bool living = GameAccess::IsLivingCharacter(actor);
-            auto bones = GameAccess::GetBonePoints(actor, 256);
-            const bool rawBones = !bones.empty();
-            if (bones.empty())
-                bones = GameAccess::GetCachedPoseSkeleton(actor);
-            out << '[' << dumped << "] actor=0x" << std::hex << actor << std::dec
-                << " enemy=" << YesNo(enemy) << " living=" << YesNo(living)
-                << " locValid=" << YesNo(locationOk)
-                << " location={" << location.X << ',' << location.Y << ',' << location.Z << '}'
-                << " bonePoints=" << bones.size()
-                << " boneSource=" << (rawBones ? "raw component transforms" :
-                    (bones.empty() ? "none" : "IRR body live-pose cache")) << "\n";
-            ++dumped;
-        }
-
         out << "\n=== AIMBOT ===\n";
         const auto& a = Aimbot::GetDiagnostics();
         Hex(out, "Aim controller", a.Controller);
@@ -257,7 +204,6 @@ namespace DiagnosticsService
             << " LMB=" << YesNo(a.LmbHeld)
             << " activation=" << YesNo(a.ActivationHeld)
             << " attempted=" << YesNo(a.AimAttempted)
-            << " visible=" << YesNo(a.TargetVisible)
             << " sticky=" << YesNo(a.StickyTarget)
             << " mouseInput=" << YesNo(a.UsedMouseInput)
             << " setControlRotation=" << YesNo(a.UsedSetControlRotationFunction) << "\n";
@@ -267,17 +213,9 @@ namespace DiagnosticsService
             << " range=" << a.DistanceCandidates
             << " projected=" << a.ProjectedTargets
             << " inFov=" << a.InFovTargets
-            << " verifiedBones=" << a.VerifiedBoneTargets
+            << " liveBodyPoints=" << a.LiveBodyTargets
             << " poseAware=" << a.PoseAwareTargets
             << " poseFailures=" << a.PoseAwareFailures << "\n";
-        out << "LOS cache: checks=" << a.LineOfSightChecks
-            << " targetSpherePasses=" << a.TargetSpherePasses
-            << " occluded=" << a.OccludedTargets
-            << " hits=" << a.VisibilityCacheHits
-            << " pending/misses=" << a.VisibilityCacheMisses
-            << " queued=" << a.VisibilityQueriesQueued
-            << " taskPending=" << YesNo(a.VisibilityTaskPending)
-            << " sampleThread=" << a.VisibilitySampleThreadId << "\n";
         out << "Target world={" << a.TargetWorld.X << ',' << a.TargetWorld.Y << ','
             << a.TargetWorld.Z << "} velocity={" << a.TargetVelocity.X << ','
             << a.TargetVelocity.Y << ',' << a.TargetVelocity.Z << "}\n";
@@ -287,7 +225,6 @@ namespace DiagnosticsService
             << " GObjects RVA=0x" << Offsets::GObjects
             << " OwningGameInstance=0x" << Offsets::UWorld_OwningGameInstance
             << " MainContainers=0x" << Offsets::InventoryComponent_MainContainers
-            << " CachedComponentSpaceTransforms=0x" << Offsets::USkeletalMeshComponent_CachedComponentSpaceTransforms
             << std::dec << "\n";
 
         out.flush();

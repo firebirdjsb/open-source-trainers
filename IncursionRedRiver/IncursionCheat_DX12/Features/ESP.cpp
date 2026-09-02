@@ -12,16 +12,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <limits>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 namespace
 {
-    int g_lastSkeletonActors = 0;
-    int g_lastSkeletonPoints = 0;
     int g_lastCandidateCount = 0;
     int g_lastRenderedCount = 0;
     uintptr_t g_nameCacheWorld = 0;
@@ -92,199 +88,16 @@ namespace
         bottom = track.Bottom;
     }
 
-    void DrawBoneSkeleton(const std::vector<GameAccess::BonePoint>& bones,
-                          const GameAccess::Camera& camera,
-                          int width, int height)
-    {
-        if (bones.size() < 2)
-            return;
-
-        struct ProjectedBone
-        {
-            Vector2 Screen{};
-            bool Visible = false;
-        };
-
-        std::vector<ProjectedBone> projected(bones.size());
-        std::unordered_map<int32_t, size_t> byIndex;
-        int visiblePoints = 0;
-        float minScreenY = std::numeric_limits<float>::max();
-        float maxScreenY = -std::numeric_limits<float>::max();
-        for (size_t i = 0; i < bones.size(); ++i)
-        {
-            byIndex[bones[i].Index] = i;
-            projected[i].Visible = WorldToScreen::Convert(
-                bones[i].World, projected[i].Screen,
-                camera.Location, camera.Rotation, camera.FOV, width, height);
-            if (projected[i].Visible)
-            {
-                ++visiblePoints;
-                minScreenY = std::min(minScreenY, projected[i].Screen.y);
-                maxScreenY = std::max(maxScreenY, projected[i].Screen.y);
-            }
-        }
-        if (visiblePoints < 2)
-            return;
-
-        ++g_lastSkeletonActors;
-        g_lastSkeletonPoints += visiblePoints;
-        const ImU32 shadowColor = IM_COL32(0, 0, 0, 190);
-        const ImU32 boneColor = IM_COL32(245, 248, 255, 240);
-        const float projectedHeight = std::max(0.0f, maxScreenY - minScreenY);
-        const float lineThickness = std::clamp(
-            0.95f + projectedHeight / 320.0f, 1.0f, 1.55f);
-
-        auto drawSegment = [&](const Vector2& from, const Vector2& to)
-        {
-            Renderer::DrawLine(from.x, from.y, to.x, to.y, shadowColor,
-                               lineThickness + 1.8f);
-            Renderer::DrawLine(from.x, from.y, to.x, to.y, boneColor,
-                               lineThickness);
-        };
-
-        // Prefer the verified native reference-skeleton parent topology. If Dumper-7
-        // cannot prove that native array for a particular mesh, fall back to an
-        // anatomical chain selected from the *real cached bone transforms*. This keeps
-        // Bone ESP useful without inventing world positions or reading guessed offsets.
-        int parentEdges = 0;
-        for (size_t i = 0; i < bones.size(); ++i)
-        {
-            if (!projected[i].Visible)
-                continue;
-            const auto parent = byIndex.find(bones[i].ParentIndex);
-            if (parent != byIndex.end() && projected[parent->second].Visible)
-            {
-                drawSegment(projected[i].Screen,
-                            projected[parent->second].Screen);
-                ++parentEdges;
-            }
-        }
-
-        // The IRR pose skeleton adds neck/pelvis indices 9/10. Give its exact eye
-        // anchor a proportional head ring like a conventional skeleton overlay.
-        if ((byIndex.find(9) != byIndex.end() || byIndex.find(10) != byIndex.end()))
-        {
-            const auto head = byIndex.find(0);
-            if (head != byIndex.end() && projected[head->second].Visible)
-            {
-                const float radius = std::clamp(projectedHeight * 0.075f, 3.0f, 11.0f);
-                Renderer::DrawCircle(projected[head->second].Screen.x,
-                                     projected[head->second].Screen.y,
-                                     radius + 1.5f, shadowColor);
-                Renderer::DrawCircle(projected[head->second].Screen.x,
-                                     projected[head->second].Screen.y,
-                                     radius, boneColor);
-            }
-        }
-
-        if (parentEdges == 0)
-        {
-            double minZ = 1.0e30;
-            double maxZ = -1.0e30;
-            for (size_t i = 0; i < bones.size(); ++i)
-            {
-                if (!projected[i].Visible)
-                    continue;
-                minZ = std::min(minZ, bones[i].World.Z);
-                maxZ = std::max(maxZ, bones[i].World.Z);
-            }
-            const double heightSpan = maxZ - minZ;
-            if (std::isfinite(heightSpan) && heightSpan > 40.0 && heightSpan < 350.0)
-            {
-                auto centralAt = [&](double normalizedZ) -> int
-                {
-                    int best = -1;
-                    double bestScore = 1.0e30;
-                    const double targetZ = minZ + heightSpan * normalizedZ;
-                    for (size_t i = 0; i < bones.size(); ++i)
-                    {
-                        if (!projected[i].Visible)
-                            continue;
-                        const double lateral = std::abs(bones[i].Component.Y);
-                        const double score = std::abs(bones[i].World.Z - targetZ) * 3.0 +
-                                             lateral * 0.20;
-                        if (score < bestScore)
-                        {
-                            bestScore = score;
-                            best = static_cast<int>(i);
-                        }
-                    }
-                    return best;
-                };
-
-                auto lateralAt = [&](double minNorm, double maxNorm, bool positive,
-                                     bool farthest) -> int
-                {
-                    int best = -1;
-                    double metric = farthest ?
-                        -1.0 : 1.0e30;
-                    for (size_t i = 0; i < bones.size(); ++i)
-                    {
-                        if (!projected[i].Visible)
-                            continue;
-                        const double norm = (bones[i].World.Z - minZ) / heightSpan;
-                        if (norm < minNorm || norm > maxNorm)
-                            continue;
-                        const double side = bones[i].Component.Y;
-                        if ((positive && side < 0.0) || (!positive && side > 0.0))
-                            continue;
-                        const double magnitude = std::abs(side);
-                        if ((farthest && magnitude > metric) ||
-                            (!farthest && magnitude < metric))
-                        {
-                            metric = magnitude;
-                            best = static_cast<int>(i);
-                        }
-                    }
-                    return best;
-                };
-
-                const int head = centralAt(0.98);
-                const int neck = centralAt(0.86);
-                const int chest = centralAt(0.68);
-                const int pelvis = centralAt(0.48);
-                const int shoulderL = lateralAt(0.62, 0.82, true, true);
-                const int shoulderR = lateralAt(0.62, 0.82, false, true);
-                const int handL = lateralAt(0.42, 0.76, true, true);
-                const int handR = lateralAt(0.42, 0.76, false, true);
-                const int kneeL = lateralAt(0.18, 0.48, true, false);
-                const int kneeR = lateralAt(0.18, 0.48, false, false);
-                const int footL = lateralAt(0.00, 0.24, true, true);
-                const int footR = lateralAt(0.00, 0.24, false, true);
-
-                auto line = [&](int a, int b)
-                {
-                    if (a < 0 || b < 0 || a == b)
-                        return;
-                    drawSegment(projected[static_cast<size_t>(a)].Screen,
-                                projected[static_cast<size_t>(b)].Screen);
-                };
-                line(head, neck);
-                line(neck, chest);
-                line(chest, pelvis);
-                line(chest, shoulderL);
-                line(shoulderL, handL);
-                line(chest, shoulderR);
-                line(shoulderR, handR);
-                line(pelvis, kneeL);
-                line(kneeL, footL);
-                line(pelvis, kneeR);
-                line(kneeR, footR);
-            }
-        }
-    }
 }
 
 namespace ESP
 {
     bool bEnabled = true;
     bool bDrawBoxes = true;
-    bool bDrawSkeleton = false;
     bool bShowHealth = true;
     bool bShowNames = true;
     bool bShowDistance = true;
     float maxDistanceMeters = 150.0f;
-    float skeletonDistanceMeters = 75.0f;
     int maxActors = 25;
 
     void Init() {}
@@ -295,8 +108,6 @@ namespace ESP
 
     void Run()
     {
-        g_lastSkeletonActors = 0;
-        g_lastSkeletonPoints = 0;
         g_lastCandidateCount = 0;
         g_lastRenderedCount = 0;
 
@@ -358,28 +169,6 @@ namespace ESP
             [](const Candidate& a, const Candidate& b)
             { return a.DistanceMeters < b.DistanceMeters; });
 
-        if (bDrawSkeleton)
-        {
-            std::vector<uintptr_t> poseActors;
-            poseActors.reserve(std::min<size_t>(candidates.size(), 16));
-            for (const Candidate& candidate : candidates)
-            {
-                if (candidate.DistanceMeters > skeletonDistanceMeters)
-                    break;
-                Vector2 actorScreen{};
-                if (!WorldToScreen::Convert(candidate.Location, actorScreen,
-                        camera.Location, camera.Rotation, camera.FOV, width, height) ||
-                    actorScreen.x < -100.0f || actorScreen.x > display.x + 100.0f ||
-                    actorScreen.y < -100.0f || actorScreen.y > display.y + 100.0f)
-                    continue;
-                poseActors.push_back(candidate.Actor);
-                if (poseActors.size() >= static_cast<size_t>(
-                        std::clamp(maxActors, 1, 16)))
-                    break;
-            }
-            GameAccess::RequestPoseSamples(poseActors, 75);
-        }
-
         for (const Candidate& candidate : candidates)
         {
             if (g_lastRenderedCount >= std::max(maxActors, 1))
@@ -415,21 +204,6 @@ namespace ESP
                 continue;
 
             ++g_lastRenderedCount;
-            if (bDrawSkeleton && candidate.DistanceMeters <= skeletonDistanceMeters)
-            {
-                // Prefer IRR's named, live body-part sample. The generic mesh cache
-                // can expose only a tiny partial parent chain for these NPC meshes,
-                // which was the arrow-shaped overlay seen in testing.
-                auto bones = GameAccess::GetCachedPoseSkeleton(candidate.Actor);
-                if (bones.empty())
-                {
-                    auto nativeBones = GameAccess::GetBonePoints(candidate.Actor);
-                    if (nativeBones.size() >= 8)
-                        bones = std::move(nativeBones);
-                }
-                DrawBoneSkeleton(bones, camera, width, height);
-            }
-
             const ImU32 color = candidate.Hostile ? IM_COL32(255, 90, 90, 230) :
                                                    IM_COL32(255, 190, 70, 220);
             if (bDrawBoxes)
@@ -483,7 +257,6 @@ namespace ESP
     {
         ImGui::Checkbox("Enable ESP", &bEnabled);
         ImGui::Checkbox("Boxes", &bDrawBoxes);
-        ImGui::Checkbox("Skeleton / Bone ESP", &bDrawSkeleton);
         ImGui::Checkbox("Health", &bShowHealth);
         ImGui::Checkbox("Names", &bShowNames);
         ImGui::Checkbox("Distance", &bShowDistance);
@@ -491,26 +264,8 @@ namespace ESP
         ImGui::SliderInt("Max On-screen Actors", &maxActors, 5, 100);
         ImGui::Text("On-screen candidates: %d | rendered: %d",
             g_lastCandidateCount, g_lastRenderedCount);
-        if (bDrawSkeleton)
-        {
-            ImGui::SliderFloat("Skeleton Distance", &skeletonDistanceMeters,
-                               10.0f, 250.0f, "%.0f m");
-            const auto& d = GameAccess::GetDiagnostics();
-            const auto pose = GameAccess::GetPoseCacheDiagnostics();
-            ImGui::Text("Bone cache: %d actors / %d points (independent)",
-                d.ValidatedBoneActorCount, d.ValidatedBonePointCount);
-            ImGui::Text("Live pose cache: %d | last %d/%d | aggregate %d | fallback %d",
-                pose.CachedActors, pose.LastSampledActors, pose.LastRequestedActors,
-                pose.LastAggregateActors, pose.LastFallbackActors);
-            ImGui::Text("Pose task: %s | game thread %lu",
-                pose.TaskPending ? "SAMPLING" : "READY",
-                static_cast<unsigned long>(pose.LastSampleThreadId));
-            ImGui::Text("Projected this frame: %d actors / %d visible points",
-                g_lastSkeletonActors, g_lastSkeletonPoints);
-        }
         ImGui::TextWrapped("ESP is projected from LastFrameCameraCachePrivate, matching the backbuffer being presented instead of a newer game-thread camera. A small adaptive filter removes sub-frame jitter but responds immediately to real turns and target movement. No per-actor ProcessEvent projection calls are made.");
-        ImGui::TextWrapped("Bone ESP prefers validated CachedComponentSpaceTransforms. Living SkeletalMeshComponentBudgeted AI that leave that base array empty use cached, game-thread IRRBodyComponent head/thorax/limb locations, so the stick figure remains available before ragdoll/death.");
         ImGui::TextWrapped("Actor discovery is based on actual IRRBaseCharacter class identity and remains independent of local-pawn acquisition; health is a secondary living/dead filter.");
-        ImGui::TextWrapped("Red actors are confirmed by the local IRRTeamComponent Hostiles array. Amber candidates are shown only while that team list is unavailable, so acquisition and bone debugging can continue without mislabeling them as enemies.");
+        ImGui::TextWrapped("Red actors are confirmed by the local IRRTeamComponent Hostiles array. Amber candidates are shown only while that team list is unavailable, so actor acquisition can continue without mislabeling them as enemies.");
     }
 }

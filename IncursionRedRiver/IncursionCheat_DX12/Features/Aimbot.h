@@ -23,8 +23,6 @@ namespace Aimbot
         bool UsedSetControlRotationFunction = false;
         bool DirectWriteSucceeded = false;
         bool RotationChangedAfterAttempt = false;
-        bool VisibilityRequired = false;
-        bool TargetVisible = false;
         bool StickyTarget = false;
         bool UsedEyeViewPoint = false;
         bool UsedPoseAwareBodyPart = false;
@@ -37,27 +35,18 @@ namespace Aimbot
         int EnemyCandidates = 0;
         int LivingCandidates = 0;
         int DistanceCandidates = 0;
-        int VerifiedBoneTargets = 0;
+        int LiveBodyTargets = 0;
         int CapsuleFallbackTargets = 0;
         int PoseAwareTargets = 0;
         int PoseAwareFailures = 0;
         int ProjectedTargets = 0;
         int InFovTargets = 0;
-        int LineOfSightChecks = 0;
-        int OccludedTargets = 0;
-        int VisibilityCacheHits = 0;
-        int VisibilityCacheMisses = 0;
-        int VisibilityQueriesQueued = 0;
-        int TargetSpherePasses = 0;
-        uint32_t VisibilitySampleThreadId = 0;
-        bool VisibilityTaskPending = false;
     };
 
     extern bool bEnabled;
     extern bool bDrawFov;
     extern bool bSmoothAim;
     extern bool bUseMouseInput;
-    extern bool bVisibilityCheck;
     extern bool bAimOnFire;
     extern bool bPrediction;
     extern float smoothAmount;

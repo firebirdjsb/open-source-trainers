@@ -40,8 +40,6 @@ namespace
         uintptr_t GameInstance = 0;
         uintptr_t GameViewportClient = 0;
         uintptr_t LocalPlayer = 0;
-        uintptr_t SkeletalMesh = 0;
-        uintptr_t SkeletalMeshComponent = 0;
         uintptr_t SenseStimulusComponent = 0;
         uintptr_t IRRBaseCharacter = 0;
         uintptr_t IRRAIBaseCharacter = 0;
@@ -56,12 +54,6 @@ namespace
         uintptr_t IRRTeamComponent = 0;
         uintptr_t WeaponComponent = 0;
         uintptr_t BPMasterWeapon = 0;
-    };
-
-    struct BoneCacheEntry
-    {
-        std::vector<GameAccess::BonePoint> Points;
-        GameAccess::BoneDiagnostics Diagnostics{};
     };
 
     struct ClassPair
@@ -84,17 +76,6 @@ namespace
         }
     };
 
-    struct ParentCacheEntry
-    {
-        std::vector<int32_t> Parents;
-        uintptr_t Data = 0;
-        int32_t Count = 0;
-        int32_t Stride = 0;
-        int32_t ParentOffset = 0;
-        ULONGLONG LastAttempt = 0;
-        bool Valid = false;
-    };
-
     struct PoseCacheEntry
     {
         std::array<FVector, 9> Parts{};
@@ -110,7 +91,6 @@ namespace
     };
 
     GameAccess::RuntimeDiagnostics g_diag{};
-    GameAccess::BoneDiagnostics g_lastBoneDiag{};
     ObjectArrayLayout g_objects{};
     ClassPointers g_classes{};
     std::vector<uintptr_t> g_allObjects;
@@ -131,8 +111,6 @@ namespace
     std::vector<uintptr_t> g_actors;
     std::vector<uintptr_t> g_characters;
     std::unordered_set<uintptr_t> g_hostileCharacters;
-    std::unordered_map<uintptr_t, BoneCacheEntry> g_boneCache;
-    std::unordered_map<uintptr_t, ParentCacheEntry> g_parentCache;
     std::unordered_map<uintptr_t, PoseCacheEntry> g_poseCache;
     std::unordered_set<uintptr_t> g_poseQueuedActors;
     std::mutex g_poseCacheMutex;
@@ -152,9 +130,6 @@ namespace
     uintptr_t g_discoveredObjectArrayRoot = 0;
     bool g_objectArrayUsedSectionScan = false;
     int32_t g_objectArrayProbeScore = 0;
-    ULONGLONG g_lastBoneDiagnosticAttempt = 0;
-    int32_t g_lastValidatedBoneActors = 0;
-    int32_t g_lastValidatedBonePoints = 0;
     uintptr_t g_processEventAddress = 0;
     uintptr_t g_lastFunctionObject = 0;
     int32_t g_lastFunctionIndex = -1;
@@ -174,7 +149,6 @@ namespace
         uintptr_t Pawn = 0;
         uintptr_t Weapon = 0;
         int32_t Characters = 0;
-        int32_t BoneActors = 0;
     };
 
     RuntimeLogSnapshot g_lastRuntimeLog{};
@@ -205,7 +179,7 @@ namespace
 
         // This native function returns all main body anchors in one call. The old
         // implementation invoked nine separate functions per actor/sample, which
-        // caused the large frame-time spike reported with Skeleton ESP enabled.
+        // caused a large frame-time spike when many live pose targets were sampled.
         struct MainBoneParams
         {
             TArray<FVector> OutLocations{};
@@ -602,8 +576,6 @@ namespace
         g_classes.GameInstance = GetObjectAt(g_objects, ObjectIndices::UGameInstanceClass);
         g_classes.GameViewportClient = GetObjectAt(g_objects, ObjectIndices::UGameViewportClientClass);
         g_classes.LocalPlayer = GetObjectAt(g_objects, ObjectIndices::ULocalPlayerClass);
-        g_classes.SkeletalMesh = GetObjectAt(g_objects, ObjectIndices::USkeletalMeshClass);
-        g_classes.SkeletalMeshComponent = GetObjectAt(g_objects, ObjectIndices::USkeletalMeshComponentClass);
         g_classes.SenseStimulusComponent = GetObjectAt(g_objects, ObjectIndices::SenseStimulusComponentClass);
         g_classes.IRRBaseCharacter = GetObjectAt(g_objects, ObjectIndices::IRRBaseCharacterClass);
         g_classes.IRRAIBaseCharacter = GetObjectAt(g_objects, ObjectIndices::IRRAIBaseCharacterClass);
@@ -779,7 +751,6 @@ namespace
         current.Pawn = g_diag.Pawn;
         current.Weapon = g_diag.EquippedWeapon;
         current.Characters = g_diag.ActiveCharacterCount;
-        current.BoneActors = g_diag.ValidatedBoneActorCount;
 
         const ULONGLONG now = GetTickCount64();
         const bool changed = !g_hasRuntimeLog ||
@@ -793,14 +764,13 @@ namespace
             current.Controller != g_lastRuntimeLog.Controller ||
             current.Pawn != g_lastRuntimeLog.Pawn ||
             current.Weapon != g_lastRuntimeLog.Weapon ||
-            current.Characters != g_lastRuntimeLog.Characters ||
-            current.BoneActors != g_lastRuntimeLog.BoneActors;
+            current.Characters != g_lastRuntimeLog.Characters;
         if (!changed && now - g_lastRuntimeLogTime < 15000)
             return;
 
         DebugLog("[Runtime] stage=%s | GUObjectArray=0x%llX objects=%d probe=%d/5 source=%s | "
                  "World=0x%llX GI=0x%llX LocalPlayer=0x%llX Controller=0x%llX "
-                 "Pawn=0x%llX Weapon=0x%llX | characters=%d boneActors=%d\n",
+                 "Pawn=0x%llX Weapon=0x%llX | characters=%d\n",
             current.FailureStage.c_str(),
             static_cast<unsigned long long>(current.ObjectArray), current.ObjectCount,
             current.ObjectProbeScore,
@@ -810,8 +780,7 @@ namespace
             static_cast<unsigned long long>(current.LocalPlayer),
             static_cast<unsigned long long>(current.Controller),
             static_cast<unsigned long long>(current.Pawn),
-            static_cast<unsigned long long>(current.Weapon), current.Characters,
-            current.BoneActors);
+            static_cast<unsigned long long>(current.Weapon), current.Characters);
         g_lastRuntimeLog = std::move(current);
         g_lastRuntimeLogTime = now;
         g_hasRuntimeLog = true;
@@ -1106,183 +1075,6 @@ namespace
         return out.IsFinite();
     }
 
-    bool FindParentIndices(uintptr_t skeletalMesh, int32_t transformCount,
-                           std::vector<int32_t>& parents,
-                           GameAccess::BoneDiagnostics& diagnostics)
-    {
-        parents.clear();
-        if (!skeletalMesh || transformCount < 2 || transformCount > 512)
-            return false;
-        const ULONGLONG now = GetTickCount64();
-        auto& cached = g_parentCache[skeletalMesh];
-        if (cached.LastAttempt && now - cached.LastAttempt < 2000)
-        {
-            if (!cached.Valid || cached.Parents.size() < static_cast<size_t>(transformCount))
-                return false;
-            parents.assign(cached.Parents.begin(), cached.Parents.begin() + transformCount);
-            diagnostics.ParentArray = cached.Data;
-            diagnostics.ParentCount = cached.Count;
-            diagnostics.ParentInfoStride = cached.Stride;
-            diagnostics.ParentFieldOffset = cached.ParentOffset;
-            diagnostics.ParentIndicesValid = true;
-            return true;
-        }
-        cached = {};
-        cached.LastAttempt = now;
-        struct Candidate
-        {
-            uintptr_t Data = 0;
-            int32_t Count = 0;
-            int32_t Stride = 0;
-            int32_t ParentOffset = 0;
-            int Score = 0;
-        };
-        Candidate best{};
-
-        // FReferenceSkeleton is native. Locate its bone-info array by validating the
-        // real parent-before-child invariant instead of guessing connections by distance.
-        for (uintptr_t offset = 0x100; offset <= 0x780; offset += 8)
-        {
-            const auto array = Memory::Read<TArray<uint8_t>>(skeletalMesh + offset);
-            const uintptr_t data = reinterpret_cast<uintptr_t>(array.Data);
-            if (!array.IsSane(1024) || !data || array.Count < transformCount ||
-                array.Count > transformCount + 64)
-                continue;
-            for (const int32_t stride : { 0x0C, 0x10, 0x18, 0x20, 0x28 })
-            {
-                for (const int32_t parentOffset : { 0x08, 0x0C, 0x10, 0x18 })
-                {
-                    const int32_t samples = std::min(array.Count, std::min(transformCount, 96));
-                    int score = 0;
-                    int roots = 0;
-                    for (int32_t i = 0; i < samples; ++i)
-                    {
-                        const int32_t parent = Memory::Read<int32_t>(
-                            data + static_cast<uintptr_t>(i) * stride + parentOffset);
-                        if (parent == -1) { ++roots; score += i == 0 ? 6 : -2; }
-                        else if (parent >= 0 && parent < i) score += 3;
-                        else score -= 8;
-                    }
-                    if (roots >= 1 && roots <= 4 && score > best.Score)
-                        best = { data, array.Count, stride, parentOffset, score };
-                }
-            }
-        }
-        if (!best.Data || best.Score < std::min(transformCount, 32) * 2)
-            return false;
-        parents.resize(static_cast<size_t>(transformCount), -1);
-        for (int32_t i = 0; i < transformCount; ++i)
-        {
-            const int32_t parent = Memory::Read<int32_t>(best.Data +
-                static_cast<uintptr_t>(i) * best.Stride + best.ParentOffset);
-            if (i == 0) parents[0] = -1;
-            else if (parent >= 0 && parent < i) parents[static_cast<size_t>(i)] = parent;
-            else return false;
-        }
-        cached.Parents = parents;
-        cached.Data = best.Data;
-        cached.Count = best.Count;
-        cached.Stride = best.Stride;
-        cached.ParentOffset = best.ParentOffset;
-        cached.LastAttempt = now;
-        cached.Valid = true;
-        diagnostics.ParentArray = best.Data;
-        diagnostics.ParentCount = best.Count;
-        diagnostics.ParentInfoStride = best.Stride;
-        diagnostics.ParentFieldOffset = best.ParentOffset;
-        diagnostics.ParentIndicesValid = true;
-        return true;
-    }
-
-    BoneCacheEntry BuildBoneCache(uintptr_t actor, int32_t maxBones)
-    {
-        BoneCacheEntry result{};
-        auto& diagnostics = result.Diagnostics;
-        diagnostics.Actor = actor;
-        if (!actor)
-            return result;
-
-        diagnostics.Mesh = Memory::Read<uintptr_t>(actor + Offsets::ACharacter_Mesh);
-        diagnostics.MeshTypeValid = IsObjectOfClass(
-            diagnostics.Mesh, g_classes.SkeletalMeshComponent);
-        if (!diagnostics.Mesh ||
-            (g_classes.SkeletalMeshComponent && !diagnostics.MeshTypeValid))
-            return result;
-
-        diagnostics.SkinnedAsset = Memory::Read<uintptr_t>(diagnostics.Mesh +
-            Offsets::USkinnedMeshComponent_SkinnedAsset);
-        if (!diagnostics.SkinnedAsset)
-            diagnostics.SkinnedAsset = Memory::Read<uintptr_t>(diagnostics.Mesh +
-                Offsets::USkinnedMeshComponent_SkeletalMesh);
-        if (g_classes.SkeletalMesh &&
-            !IsObjectOfClass(diagnostics.SkinnedAsset, g_classes.SkeletalMesh))
-            diagnostics.SkinnedAsset = 0;
-        diagnostics.Skeleton = diagnostics.SkinnedAsset ?
-            Memory::Read<uintptr_t>(diagnostics.SkinnedAsset +
-                Offsets::USkeletalMesh_Skeleton) : 0;
-
-        const auto transforms = Memory::Read<TArray<FTransform>>(diagnostics.Mesh +
-            Offsets::USkeletalMeshComponent_CachedComponentSpaceTransforms);
-        diagnostics.TransformData = reinterpret_cast<uintptr_t>(transforms.Data);
-        diagnostics.TransformCount = transforms.Count;
-        diagnostics.TransformCapacity = transforms.Max;
-        // TArray::Max is allocation capacity, not the number of live bones. Some
-        // current-build skeletal components reserve more than 256 transforms even
-        // when their live Count is below that. Treating Max > maxBones as invalid
-        // caused otherwise-good enemy meshes to produce an empty bone cache.
-        diagnostics.TransformArrayValid = transforms.IsSane(1024) &&
-            transforms.Data && transforms.Count > 1;
-        if (!diagnostics.TransformArrayValid)
-            return result;
-
-        const int32_t boneCount = std::min(transforms.Count, std::max(maxBones, 2));
-        const int32_t sampleCount = std::min(boneCount, 4);
-        for (int32_t i = 0; i < sampleCount; ++i)
-        {
-            FVector sample{};
-            if (Memory::TryRead(diagnostics.TransformData +
-                static_cast<uintptr_t>(i) * sizeof(FTransform) + 0x20, sample) &&
-                sample.IsFinite())
-                diagnostics.SampleTranslations[
-                    static_cast<size_t>(diagnostics.SampleCount++)] = sample;
-        }
-
-        std::vector<int32_t> parents;
-        FindParentIndices(diagnostics.SkinnedAsset, boneCount, parents, diagnostics);
-
-        FVector actorLocation{};
-        if (!GameAccess::GetActorLocation(actor, actorLocation))
-            return result;
-        const double maxDistance = std::max(500.0,
-            static_cast<double>(GameAccess::GetCapsuleHalfHeight(actor)) * 5.0);
-        result.Points.reserve(static_cast<size_t>(boneCount));
-        for (int32_t i = 0; i < boneCount; ++i)
-        {
-            FVector componentPosition{};
-            if (!Memory::TryRead(diagnostics.TransformData +
-                static_cast<uintptr_t>(i) * sizeof(FTransform) + 0x20,
-                componentPosition) || !componentPosition.IsFinite() ||
-                componentPosition.Length() > 5000.0)
-                continue;
-            FVector worldPosition{};
-            if (!ComponentPointToWorld(diagnostics.Mesh, componentPosition, worldPosition) ||
-                worldPosition.Distance(actorLocation) > maxDistance)
-                continue;
-            const int32_t parent = parents.empty() ? -1 : parents[static_cast<size_t>(i)];
-            result.Points.push_back({ i, parent, componentPosition, worldPosition });
-        }
-        return result;
-    }
-
-    const BoneCacheEntry& GetCachedBones(uintptr_t actor, int32_t maxBones)
-    {
-        const auto found = g_boneCache.find(actor);
-        if (found != g_boneCache.end())
-            return found->second;
-        auto inserted = g_boneCache.emplace(actor, BuildBoneCache(actor, maxBones));
-        g_lastBoneDiag = inserted.first->second.Diagnostics;
-        return inserted.first->second;
-    }
 }
 
 namespace GameAccess
@@ -1305,7 +1097,6 @@ namespace GameAccess
     void Reset()
     {
         g_diag = {};
-        g_lastBoneDiag = {};
         g_objects = {};
         g_classes = {};
         g_allObjects.clear();
@@ -1326,8 +1117,6 @@ namespace GameAccess
         g_characters.clear();
         g_hostileCharacters.clear();
         g_staminaAttributes.clear();
-        g_boneCache.clear();
-        g_parentCache.clear();
         {
             std::lock_guard<std::mutex> lock(g_poseCacheMutex);
             g_poseCache.clear();
@@ -1348,9 +1137,6 @@ namespace GameAccess
         g_discoveredObjectArrayRoot = 0;
         g_objectArrayUsedSectionScan = false;
         g_objectArrayProbeScore = 0;
-        g_lastBoneDiagnosticAttempt = 0;
-        g_lastValidatedBoneActors = 0;
-        g_lastValidatedBonePoints = 0;
         g_processEventAddress = 0;
         g_lastFunctionObject = 0;
         g_lastFunctionIndex = -1;
@@ -1364,7 +1150,6 @@ namespace GameAccess
     void Refresh()
     {
         RefreshObjectsIfNeeded();
-        g_boneCache.clear();
         g_actors.clear();
         g_characters.clear();
         g_hostileCharacters.clear();
@@ -1612,32 +1397,6 @@ namespace GameAccess
         if (!g_characters.empty())
             g_diag.WorldIsActiveRaid = true;
 
-        // Populate a bounded skeletal-validation sample before ESP projection. This
-        // keeps mesh/transform diagnostics alive even when the local controller or
-        // camera chain has not been recovered yet.
-        const ULONGLONG boneNow = GetTickCount64();
-        if (!g_lastBoneDiagnosticAttempt || boneNow - g_lastBoneDiagnosticAttempt >= 1000)
-        {
-            g_lastBoneDiagnosticAttempt = boneNow;
-            g_lastValidatedBoneActors = 0;
-            g_lastValidatedBonePoints = 0;
-            int32_t boneActorsAttempted = 0;
-            for (const uintptr_t actor : g_characters)
-            {
-                const auto& bones = GetCachedBones(actor, 256);
-                if (bones.Diagnostics.TransformArrayValid && !bones.Points.empty())
-                {
-                    ++g_lastValidatedBoneActors;
-                    g_lastValidatedBonePoints += static_cast<int32_t>(bones.Points.size());
-                    g_lastBoneDiag = bones.Diagnostics;
-                }
-                if (++boneActorsAttempted >= 2)
-                    break;
-            }
-        }
-        g_diag.ValidatedBoneActorCount = g_lastValidatedBoneActors;
-        g_diag.ValidatedBonePointCount = g_lastValidatedBonePoints;
-
         // Use the game's own per-player hostility list. This avoids treating every
         // non-local IRR character (including co-op players or neutral factions) as an
         // enemy. ESP may still render typed candidates when this list is unavailable,
@@ -1784,7 +1543,6 @@ namespace GameAccess
     }
 
     const RuntimeDiagnostics& GetDiagnostics() { return g_diag; }
-    const BoneDiagnostics& GetBoneDiagnostics() { return g_lastBoneDiag; }
     PoseCacheDiagnostics GetPoseCacheDiagnostics()
     {
         PoseCacheDiagnostics out{};
@@ -1955,71 +1713,6 @@ namespace GameAccess
             return false;
         return Memory::TryRead(object + Offsets::UObject_NamePrivate, outName) &&
                outName.IsValid();
-    }
-
-    bool HasLineOfSight(uintptr_t actor, const FVector& targetPoint,
-                        bool& outVisible, bool* outUsedTargetSphere)
-    {
-        outVisible = false;
-        if (outUsedTargetSphere)
-            *outUsedTargetSphere = false;
-        const uintptr_t controller = GetLocalController();
-        if (!controller || !actor || !targetPoint.IsFinite())
-            return false;
-
-        // A zero ViewPoint tells AController::LineOfSightTo to obtain its own
-        // authoritative eye position. Passing the render-camera snapshot here was
-        // subtly wrong: the request is dispatched to the game thread later, so that
-        // snapshot can belong to an older frame and reject an otherwise exposed pawn.
-        alignas(8) uint8_t params[0x28]{};
-        std::memcpy(params + 0x00, &actor, sizeof(actor));
-        params[0x20] = 0;
-        const bool actorLosCalled = InvokeFunctionRaw(controller,
-            FunctionIndices::Controller_LineOfSightTo, params, sizeof(params));
-        if (actorLosCalled && params[0x21] != 0)
-        {
-            outVisible = true;
-            return true;
-        }
-
-        // LineOfSightTo primarily reasons about the actor origin and its generic
-        // pawn probes. IRR exposes a purpose-built sphere visibility helper, so use
-        // it for the exact selected live-pose point when the actor-level pass says
-        // no. This fixes low-cover/crouch false negatives while still performing a
-        // collision trace; it is not a WasRecentlyRendered or fail-open shortcut.
-        alignas(8) uint8_t viewParams[0x30]{};
-        FVector observer{};
-        if (!InvokeFunctionRaw(controller,
-                FunctionIndices::Controller_GetPlayerViewPoint,
-                viewParams, sizeof(viewParams)))
-            return actorLosCalled;
-        std::memcpy(&observer, viewParams, sizeof(observer));
-        if (!observer.IsFinite())
-            return actorLosCalled;
-
-        const uintptr_t world = GetWorld();
-        const uintptr_t library = GetObjectByIndex(
-            ObjectIndices::DefaultGeneralFunctionLibrary);
-        if (!world || !library)
-            return actorLosCalled;
-
-        alignas(8) uint8_t sphereParams[0x48]{};
-        constexpr float ProbeRadiusCm = 14.0f;
-        constexpr int32_t ProbeRayCount = 5;
-        std::memcpy(sphereParams + 0x00, &world, sizeof(world));
-        std::memcpy(sphereParams + 0x08, &observer, sizeof(observer));
-        std::memcpy(sphereParams + 0x20, &targetPoint, sizeof(targetPoint));
-        std::memcpy(sphereParams + 0x38, &ProbeRadiusCm, sizeof(ProbeRadiusCm));
-        std::memcpy(sphereParams + 0x3C, &ProbeRayCount, sizeof(ProbeRayCount));
-        if (!InvokeFunctionRaw(library,
-                FunctionIndices::GeneralFunctionLibrary_CheckSphereVisibility,
-                sphereParams, sizeof(sphereParams)))
-            return actorLosCalled;
-
-        outVisible = sphereParams[0x40] != 0;
-        if (outUsedTargetSphere)
-            *outUsedTargetSphere = outVisible;
-        return true;
     }
 
     bool GetActorEyesViewPoint(uintptr_t actor, FVector& outLocation)
@@ -2278,90 +1971,6 @@ namespace GameAccess
         return true;
     }
 
-    std::vector<BonePoint> GetCachedPoseSkeleton(uintptr_t actor,
-                                                 uint32_t maximumAgeMs)
-    {
-        PoseCacheEntry cached{};
-        {
-            std::lock_guard<std::mutex> lock(g_poseCacheMutex);
-            const auto found = g_poseCache.find(actor);
-            if (found == g_poseCache.end() || !found->second.SampledAt ||
-                GetTickCount64() - found->second.SampledAt > maximumAgeMs)
-                return {};
-            cached = found->second;
-        }
-
-        if (Memory::Read<uintptr_t>(actor +
-                Offsets::IRRBaseCharacter_BodyComponent) != cached.BodyComponent)
-            return {};
-
-        FVector currentLocation{};
-        if (!GetActorLocation(actor, currentLocation))
-            return {};
-        const FVector delta = currentLocation - cached.ActorLocation;
-        // Head, thorax, stomach, right/left arm, right/left leg and right/left foot.
-        // The body-component points are pose-correct; small interpolated shoulder,
-        // neck, pelvis and hand endpoints below turn those sparse gameplay hit
-        // anchors into a readable full-body stick figure.
-        constexpr std::array<int32_t, 9> parents = {
-            9, 2, 10, 11, 12, 10, 10, 5, 6
-        };
-        std::vector<BonePoint> points;
-        points.reserve(15);
-        for (int32_t index = 0; index < 9; ++index)
-        {
-            if ((cached.ValidMask & static_cast<uint16_t>(1u << index)) == 0)
-                continue;
-            const FVector worldPoint = cached.Parts[static_cast<size_t>(index)] + delta;
-            if (!worldPoint.IsFinite())
-                continue;
-            points.push_back({ index, parents[static_cast<size_t>(index)],
-                               worldPoint - currentLocation, worldPoint });
-        }
-        auto addJoint = [&](int32_t index, int32_t parent, const FVector& worldPoint)
-        {
-            if (worldPoint.IsFinite() && worldPoint.Distance(currentLocation) < 275.0)
-                points.push_back({ index, parent, worldPoint - currentLocation,
-                                   worldPoint });
-        };
-
-        FVector head{}, thorax{}, stomach{}, rightArm{}, leftArm{};
-        FVector rightLeg{}, leftLeg{};
-        const bool haveHead = PoseTargetFromEntry(cached, "head", delta, head);
-        const bool haveThorax = PoseTargetFromEntry(cached, "chest", delta, thorax);
-        const bool haveStomach = PoseTargetFromEntry(cached, "stomach", delta, stomach);
-        const bool haveRightArm = PoseTargetFromEntry(cached, "arm_r", delta, rightArm);
-        const bool haveLeftArm = PoseTargetFromEntry(cached, "arm_l", delta, leftArm);
-        const bool haveRightLeg = PoseTargetFromEntry(cached, "leg_r", delta, rightLeg);
-        const bool haveLeftLeg = PoseTargetFromEntry(cached, "leg_l", delta, leftLeg);
-        if (haveHead && haveThorax)
-        {
-            const FVector neck = thorax + (head - thorax) * 0.68;
-            addJoint(9, 1, neck);
-        }
-        if (haveStomach && haveRightLeg && haveLeftLeg)
-        {
-            const FVector hipCenter = (rightLeg + leftLeg) * 0.5;
-            const FVector pelvis = stomach + (hipCenter - stomach) * 0.42;
-            addJoint(10, -1, pelvis);
-        }
-        if (haveThorax && haveRightArm)
-        {
-            const FVector shoulder = thorax + (rightArm - thorax) * 0.32;
-            addJoint(11, 1, shoulder);
-            const FVector hand = rightArm + (rightArm - shoulder) * 0.72;
-            addJoint(13, 3, hand);
-        }
-        if (haveThorax && haveLeftArm)
-        {
-            const FVector shoulder = thorax + (leftArm - thorax) * 0.32;
-            addJoint(12, 1, shoulder);
-            const FVector hand = leftArm + (leftArm - shoulder) * 0.72;
-            addJoint(14, 4, hand);
-        }
-        return points;
-    }
-
     bool GetActorVelocity(uintptr_t actor, FVector& outVelocity)
     {
         outVelocity = {};
@@ -2569,89 +2178,6 @@ namespace GameAccess
         const float value = capsule ? Memory::Read<float>(capsule +
             Offsets::UCapsuleComponent_CapsuleRadius) : 0.0f;
         return value > 5.0f && value < 200.0f ? value : fallback;
-    }
-
-    std::vector<BonePoint> GetBonePoints(uintptr_t actor, int32_t maxBones)
-    {
-        return GetCachedBones(actor, maxBones).Points;
-    }
-
-    bool GetVerifiedBoneTarget(uintptr_t actor, const std::string& targetName,
-                               FVector& out)
-    {
-        const auto& points = GetCachedBones(actor, 256).Points;
-        if (points.empty())
-            return false;
-        FVector actorLocation{};
-        if (!GetActorLocation(actor, actorLocation))
-            return false;
-
-        double minZ = std::numeric_limits<double>::max();
-        double maxZ = -std::numeric_limits<double>::max();
-        for (const auto& point : points)
-        {
-            minZ = std::min(minZ, point.World.Z);
-            maxZ = std::max(maxZ, point.World.Z);
-        }
-        const double height = maxZ - minZ;
-        if (!std::isfinite(height) || height < 40.0 || height > 350.0)
-            return false;
-
-        auto centralAtZ = [&](double targetZ) -> const BonePoint*
-        {
-            const BonePoint* best = nullptr;
-            double bestScore = std::numeric_limits<double>::max();
-            for (const auto& point : points)
-            {
-                const double horizontal = std::hypot(
-                    point.World.X - actorLocation.X, point.World.Y - actorLocation.Y);
-                const double score = std::abs(point.World.Z - targetZ) * 3.0 +
-                                     horizontal * 0.35;
-                if (score < bestScore) { bestScore = score; best = &point; }
-            }
-            return best;
-        };
-
-        const BonePoint* best = nullptr;
-        if (targetName == "head")
-        {
-            double scoreBest = -std::numeric_limits<double>::max();
-            for (const auto& point : points)
-            {
-                const double horizontal = std::hypot(
-                    point.World.X - actorLocation.X, point.World.Y - actorLocation.Y);
-                const double score = point.World.Z - horizontal * 0.20;
-                if (score > scoreBest) { scoreBest = score; best = &point; }
-            }
-        }
-        else if (targetName == "neck") best = centralAtZ(maxZ - height * 0.11);
-        else if (targetName == "chest") best = centralAtZ(minZ + height * 0.68);
-        else if (targetName == "pelvis") best = centralAtZ(minZ + height * 0.48);
-        else if (targetName == "hand_l" || targetName == "hand_r" ||
-                 targetName == "foot_l" || targetName == "foot_r")
-        {
-            const bool positive = targetName.back() == 'l';
-            const bool foot = targetName.rfind("foot", 0) == 0;
-            double metric = positive ? -std::numeric_limits<double>::max() :
-                                       std::numeric_limits<double>::max();
-            for (const auto& point : points)
-            {
-                const double normalizedZ = (point.World.Z - minZ) / height;
-                if ((foot && normalizedZ > 0.28) ||
-                    (!foot && (normalizedZ < 0.45 || normalizedZ > 0.82)))
-                    continue;
-                if ((positive && point.Component.Y > metric) ||
-                    (!positive && point.Component.Y < metric))
-                {
-                    metric = point.Component.Y;
-                    best = &point;
-                }
-            }
-        }
-        if (!best)
-            return false;
-        out = best->World;
-        return true;
     }
 
     Health GetHealth(uintptr_t actor)

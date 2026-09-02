@@ -4,12 +4,10 @@ namespace ESP
 {
     extern bool bEnabled;
     extern bool bDrawBoxes;
-    extern bool bDrawSkeleton;
     extern bool bShowHealth;
     extern bool bShowNames;
     extern bool bShowDistance;
     extern float maxDistanceMeters;
-    extern float skeletonDistanceMeters;
     extern int maxActors;
 
     void Init();

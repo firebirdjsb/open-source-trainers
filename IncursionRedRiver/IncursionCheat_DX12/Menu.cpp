@@ -46,7 +46,7 @@ namespace
             ImVec4(0.35f, 0.95f, 0.62f, 1.0f) : ImVec4(0.90f, 0.72f, 0.35f, 1.0f),
             "%s", g_diagnosticDumpOk ? "DUMP WRITTEN" : "READY");
         ImGui::TextWrapped("Output: %s", g_diagnosticDumpPath);
-        ImGui::TextDisabled("One-shot snapshot: hook/render state, UE chain, GUObjectArray, ProcessEvent, inventory/stash, stamina, bones, active characters and aimbot.");
+        ImGui::TextDisabled("One-shot snapshot: hook/render state, UE chain, GUObjectArray, ProcessEvent, inventory/stash, stamina, active characters and aimbot.");
         ImGui::Separator();
 
         const auto& d = GameAccess::GetDiagnostics();
@@ -152,40 +152,6 @@ namespace
                 d.ObjectCharacterCount, d.ObjectWeaponCount);
         }
 
-        if (ImGui::CollapsingHeader("Skeletal cache", ImGuiTreeNodeFlags_DefaultOpen))
-        {
-            const auto& b = GameAccess::GetBoneDiagnostics();
-            const auto pose = GameAccess::GetPoseCacheDiagnostics();
-            ImGui::Text("Independent validation: %d actors / %d points",
-                d.ValidatedBoneActorCount, d.ValidatedBonePointCount);
-            Address("diagnosed character", b.Actor);
-            Address("Character::Mesh", b.Mesh);
-            ImGui::Text("SkeletalMeshComponent type: %s",
-                b.MeshTypeValid ? "OK" : "INVALID");
-            Address("SkinnedAsset / SkeletalMesh", b.SkinnedAsset);
-            Address("Skeleton", b.Skeleton);
-            Address("CachedTransforms data", b.TransformData);
-            ImGui::Text("CachedTransforms: %d / %d | validation: %s",
-                b.TransformCount, b.TransformCapacity,
-                b.TransformArrayValid ? "OK" : "FAILED");
-            ImGui::Text("Budgeted pose: %d cached | last %d/%d | aggregate %d | fallback %d",
-                pose.CachedActors, pose.LastSampledActors, pose.LastRequestedActors,
-                pose.LastAggregateActors, pose.LastFallbackActors);
-            ImGui::Text("Pose task: %s | thread %lu",
-                pose.TaskPending ? "SAMPLING" : "READY",
-                static_cast<unsigned long>(pose.LastSampleThreadId));
-            Address("reference parent array", b.ParentArray);
-            ImGui::Text("Parents: count %d, stride 0x%X, field +0x%X | %s",
-                b.ParentCount, b.ParentInfoStride, b.ParentFieldOffset,
-                b.ParentIndicesValid ? "VERIFIED" : "NOT FOUND");
-            for (int32_t i = 0; i < b.SampleCount; ++i)
-            {
-                const auto& sample = b.SampleTranslations[static_cast<size_t>(i)];
-                ImGui::Text("Transform[%d].Translation = { %.3f, %.3f, %.3f }",
-                    i, sample.X, sample.Y, sample.Z);
-            }
-        }
-
         if (ImGui::CollapsingHeader("Aimbot verification", ImGuiTreeNodeFlags_DefaultOpen))
         {
             const auto& a = Aimbot::GetDiagnostics();
@@ -206,19 +172,12 @@ namespace
             ImGui::Text("Aim point: %s | body points: %d | body failures: %d | SetControlRotation: %s",
                 a.TargetFound ? (a.UsedPoseAwareBodyPart ? "POSE-AWARE IRR BODY PART" :
                     (a.UsedEyeViewPoint ? "ACTOR EYE VIEWPOINT" :
-                    (a.UsedCapsuleFallback ? "CAPSULE FALLBACK" : "VERIFIED BONE"))) : "NONE",
+                    (a.UsedCapsuleFallback ? "CAPSULE FALLBACK" : "LIVE BODY POINT"))) : "NONE",
                 a.PoseAwareTargets, a.PoseAwareFailures,
                 a.UsedSetControlRotationFunction ? "CALLED" : "NO");
-            ImGui::Text("Visibility: %s | LOS: %d | sphere pass: %d | occluded: %d | target: %s | sticky: %s",
-                a.VisibilityRequired ? "REQUIRED" : "OFF",
-                a.LineOfSightChecks, a.TargetSpherePasses, a.OccludedTargets,
-                a.TargetVisible ? "VISIBLE" : "NOT CONFIRMED",
+            ImGui::Text("Target lock: %s | sticky: %s",
+                a.TargetFound ? "ACQUIRED" : "WAIT",
                 a.StickyTarget ? "YES" : "NO");
-            ImGui::Text("LOS cache: hits %d | pending/miss %d | queued %d | task %s | thread %lu",
-                a.VisibilityCacheHits, a.VisibilityCacheMisses,
-                a.VisibilityQueriesQueued,
-                a.VisibilityTaskPending ? "PENDING" : "READY",
-                static_cast<unsigned long>(a.VisibilitySampleThreadId));
             ImGui::Text("Target world: { %.3f, %.3f, %.3f }",
                 a.TargetWorld.X, a.TargetWorld.Y, a.TargetWorld.Z);
             ImGui::Text("Control before: { %.3f, %.3f, %.3f }",
@@ -373,7 +332,7 @@ namespace
         switch (page)
         {
         case MenuPage::ESP: return "Enemy visualization and skeletal overlays";
-        case MenuPage::Aimbot: return "Target acquisition, visibility and ballistic prediction";
+        case MenuPage::Aimbot: return "Crosshair target acquisition and ballistic prediction";
         case MenuPage::Tactical: return "Radar, proximity awareness and off-screen threat indicators";
         case MenuPage::Player: return "Core player, weapon and survivability controls";
         case MenuPage::Movement: return "Advanced movement tuning and teleport bookmarks";

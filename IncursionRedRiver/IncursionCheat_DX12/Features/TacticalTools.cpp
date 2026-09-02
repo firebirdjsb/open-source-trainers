@@ -300,6 +300,6 @@ namespace TacticalTools
 
         ImGui::Checkbox("Line to current aimbot target", &g_targetLine);
         ImGui::SliderInt("Tactical refresh interval", &g_refreshMs, 50, 500, "%d ms");
-        ImGui::TextDisabled("Radar/edge indicators perform no LineOfSight ProcessEvent calls. Aimbot visibility remains the only LOS-heavy path.");
+        ImGui::TextDisabled("Radar/edge indicators use the shared cached actor list and add no per-actor engine calls.");
     }
 }

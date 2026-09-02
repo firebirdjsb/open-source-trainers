@@ -42,34 +42,6 @@ namespace GameAccess
         bool Valid = false;
     };
 
-    struct BonePoint
-    {
-        int32_t Index = -1;
-        int32_t ParentIndex = -1;
-        FVector Component{};
-        FVector World{};
-    };
-
-    struct BoneDiagnostics
-    {
-        uintptr_t Actor = 0;
-        uintptr_t Mesh = 0;
-        uintptr_t SkinnedAsset = 0;
-        uintptr_t Skeleton = 0;
-        uintptr_t TransformData = 0;
-        int32_t TransformCount = 0;
-        int32_t TransformCapacity = 0;
-        uintptr_t ParentArray = 0;
-        int32_t ParentCount = 0;
-        int32_t ParentInfoStride = 0;
-        int32_t ParentFieldOffset = 0;
-        std::array<FVector, 4> SampleTranslations{};
-        int32_t SampleCount = 0;
-        bool MeshTypeValid = false;
-        bool TransformArrayValid = false;
-        bool ParentIndicesValid = false;
-    };
-
     struct PoseCacheDiagnostics
     {
         int32_t CachedActors = 0;
@@ -173,8 +145,6 @@ namespace GameAccess
         int32_t ScannedControllerCount = 0;
         int32_t ScannedCharacterCount = 0;
         int32_t ActiveCharacterCount = 0;
-        int32_t ValidatedBoneActorCount = 0;
-        int32_t ValidatedBonePointCount = 0;
         const char* FailureStage = "not refreshed";
     };
 
@@ -182,7 +152,6 @@ namespace GameAccess
     void Reset();
 
     const RuntimeDiagnostics& GetDiagnostics();
-    const BoneDiagnostics& GetBoneDiagnostics();
     PoseCacheDiagnostics GetPoseCacheDiagnostics();
     const char* SourceName(Source source);
 
@@ -218,8 +187,6 @@ namespace GameAccess
     // Read-only helper for dump-verified object indices. Returns 0 until the live
     // GUObjectArray has passed the existing structural validation.
     uintptr_t GetObjectByIndex(int32_t objectIndex);
-    bool HasLineOfSight(uintptr_t actor, const FVector& targetPoint,
-                        bool& outVisible, bool* outUsedTargetSphere = nullptr);
     bool GetActorEyesViewPoint(uintptr_t actor, FVector& outLocation);
     // Uses IRRBaseCharacter::BodyComponent so the returned point follows the live
     // animation pose (including crouch/prone) instead of a standing capsule ratio.
@@ -228,11 +195,9 @@ namespace GameAccess
                                 uintptr_t* outBodyComponent = nullptr);
     // Budgeted living AI frequently leave the base component-space transform array
     // empty. Sample the game's authoritative IRRBodyComponent pose on the window/game
-    // thread, then serve immutable cached points to Present/ESP/aim acquisition.
+    // thread, then serve immutable cached points to aimbot target acquisition.
     bool RequestPoseSamples(const std::vector<uintptr_t>& actors,
                             uint32_t minimumIntervalMs = 75);
-    std::vector<BonePoint> GetCachedPoseSkeleton(uintptr_t actor,
-                                                 uint32_t maximumAgeMs = 500);
     bool GetActorVelocity(uintptr_t actor, FVector& outVelocity);
     bool PredictBallisticAim(const FVector& start, const FVector& target,
                              const FVector& targetVelocity, float maxTime,
@@ -247,8 +212,6 @@ namespace GameAccess
     bool IsIRRCharacter(uintptr_t actor);
     bool IsEnemyCharacter(uintptr_t actor);
 
-    std::vector<BonePoint> GetBonePoints(uintptr_t actor, int32_t maxBones = 256);
-    bool GetVerifiedBoneTarget(uintptr_t actor, const std::string& targetName, FVector& out);
     Health GetHealth(uintptr_t actor);
     bool IsLivingCharacter(uintptr_t actor);
     std::wstring GetPlayerName(uintptr_t actor);

@@ -29,7 +29,7 @@ A baseline Dumper-7 dump is included under:
 
 `IncursionCheat_DX12/5.6.1-0+UE5-Test_C/`
 
-The updated **2026-09-01** live-raid dump supplied at `C:\Dumper-7\5.6.1-0+UE5-Test_C\` was validated without modifying it. All **94** consumed reflected fields, **50,035** module-backed UObject definitions, and **34** stable class/function indices match the project baseline. See `DUMP_VALIDATION.md` for the commands and detailed comparison.
+The updated **2026-09-01** live-raid dump supplied at `C:\Dumper-7\5.6.1-0+UE5-Test_C\` was validated without modifying it. All **119** consumed reflected fields, **50,035** module-backed UObject definitions, and **99** stable class/function indices match the project baseline. See `DUMP_VALIDATION.md` for the commands and detailed comparison.
 
 The updated folder includes a complete property-rich GObjects dump, so the consumed field offsets are now independently confirmed by the new run. Its referenced `CppSDK/SDK/*.hpp` files are still absent, so the generated C++ SDK itself is incomplete.
 
@@ -41,7 +41,7 @@ The DX12 hook/renderer path is unchanged. A dedicated **Diagnostics** tab now di
 
 `GWorld -> OwningGameInstance -> LocalPlayers -> LocalPlayer -> PlayerController -> Pawn`
 
-It also shows the selected world and its source, viewport/engine fallbacks, `GUObjectArray` layout, actor array, equipped weapon/components, local AI stimulus component, skeletal transform array, sampled translations, reference-parent discovery, every aimbot rejection stage, and whether an RMB aim submission changed control rotation.
+It also shows the selected world and its source, viewport/engine fallbacks, `GUObjectArray` layout, actor array, equipped weapon/components, local AI stimulus component, every aimbot acquisition stage, and whether an RMB aim submission changed control rotation.
 
 The configured `GUObjectArray` RVA is structurally checked against five known UObject indices before it is trusted. If that check fails, the runtime locates and validates the array in writable PE sections. Diagnostics shows the resolved root, source, probe score, object count, and typed-object bucket counts. State changes are also written at a bounded rate to `incursion_cheat_fixed.log`, so the failing chain can be recovered even without a screenshot.
 
@@ -71,24 +71,14 @@ Build **Release | x64**, launch the game normally, then use the loader. Open **D
 The first in-game test confirmed the DX12 overlay/FOV renderer works, but exposed three gameplay-layer problems. This revision changes those paths as follows:
 
 ### Aimbot
-- Target selection prefers the live `USkeletalMeshComponent::CachedComponentSpaceTransforms` array (`0x9B8`). When the runtime reports an empty bone cache, a clearly diagnosed capsule-relative target keeps enemy acquisition operational instead of returning `Target: NONE` for every actor.
-- Bone component-space positions are converted to world space through the reflected `USceneComponent::AttachParent`, `RelativeLocation`, `RelativeRotation`, and `RelativeScale3D` chain.
+- Target selection uses the game-provided `IRRBodyComponent` locations for the selected head, chest, stomach, arm, leg, or foot. A clearly diagnosed capsule-relative target keeps acquisition operational while the live sample warms up.
 - Default aim application now uses relative Win32 mouse-look input while RMB is held because the game's Enhanced Input/camera update overwrites a raw `AController::ControlRotation` write.
 - Direct rotation mode calls the dump-confirmed `Controller::SetControlRotation` UFunction and retains a raw field write only as a fallback.
-- When skeletal validation succeeds, aimbot consumes the exact verified head/chest position produced by the Bone ESP path.
 - The Diagnostics tab records scan, hostile, living, range, projection, and FOV counts; target source; RMB state; submission status; and next-frame control-rotation observation.
-
-### Skeleton / Bone ESP
-- Added an actual `Skeleton / Bone ESP` toggle.
-- Reads live cached skeletal transforms rather than hardcoded bone offsets.
-- Validates the transform array pointer, count, capacity, and initial translations before consuming it.
-- Discovers and validates the skeletal asset's actual reference-skeleton parent-index array. No nearest-previous-bone approximation is used; if parents cannot be verified, points are shown without invented connections.
-- The ESP tab reports how many actors/bone points were resolved during the most recent frame, which makes failed skeletal traversal obvious during testing.
-- Character enumeration is independent of the local-pawn chain and class-checks `IRRBaseCharacter` instances, so ESP diagnostics can proceed while local-player discovery is still failing.
-- A bounded skeletal sample is validated during runtime refresh before camera projection, so mesh/transform counts can become non-zero even while controller/camera acquisition is failing.
-- Confirmed enemies come from the local character's reflected `IRRTeamComponent::Hostiles` array. Unknown typed characters are amber ESP diagnostics only and are never eligible for aimbot selection.
-- ESP final coordinates now use `PlayerController::ProjectWorldLocationToScreen`, so boxes/text share Unreal's current viewport projection instead of a camera-cache frame that can bob while the local player runs or jumps.
-- Expensive health/name/bone work is performed only for sorted, on-screen, distance-filtered candidates. The default is capped at 25 actors, skeleton ESP defaults off, and the large object-classification pass backs off after pawn acquisition to remove periodic hitches.
+- Target acquisition uses crosshair distance and sticky locking without an asynchronous trace/cache gate.
+- Character enumeration is independent of the local-pawn chain and class-checks `IRRBaseCharacter` instances. Confirmed enemies come from the local character's reflected `IRRTeamComponent::Hostiles` array.
+- ESP final coordinates use the render-camera snapshot matching the presented backbuffer, with adaptive filtering to reduce sub-frame jitter.
+- Expensive health/name work is performed only for sorted, on-screen, distance-filtered candidates. The default is capped at 25 actors, and the large object-classification pass backs off after pawn acquisition to remove periodic hitches.
 
 ### Infinite Ammo
 - The old implementation wrote `WeaponComponent::AmmunitionState.MagCapacity`, but that structure is only a transient snapshot and the game overwrites it.
@@ -104,7 +94,7 @@ The first in-game test confirmed the DX12 overlay/FOV renderer works, but expose
 ## Verification status
 
 - `Release | x64` clean rebuild: DLL and loader succeeded with zero compiler/linker errors.
-- `tools/verify_dump_offsets.py`: 94 reflected fields verified.
-- `tools/verify_fresh_dump_layout.py`: 50,035 module-backed objects and 34 live UClass/UFunction lookup indices verified.
+- `tools/verify_dump_offsets.py`: 119 reflected fields verified.
+- `tools/verify_fresh_dump_layout.py`: 50,035 module-backed objects and 99 live UClass/UFunction lookup indices verified.
 - Loader integration fixture: default wait-before-process, remote DLL load/signaling, module-list verification, and duplicate-injection detection all passed in an x64 local host.
 - Gameplay behavior still requires an in-raid test; a successful build and dump match do not prove that runtime object selection is correct for every menu/raid transition.

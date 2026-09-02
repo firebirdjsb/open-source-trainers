@@ -64,12 +64,6 @@ namespace Offsets
     constexpr uintptr_t USceneComponent_RelativeScale3D  = 0x170;
 
     constexpr uintptr_t APawn_PlayerState          = 0x2C8;
-    constexpr uintptr_t ACharacter_Mesh            = 0x328;
-    constexpr uintptr_t USkinnedMeshComponent_SkeletalMesh = 0x578;
-    constexpr uintptr_t USkinnedMeshComponent_SkinnedAsset = 0x580;
-    constexpr uintptr_t USkeletalMeshComponent_CachedBoneSpaceTransforms      = 0x9A8;
-    constexpr uintptr_t USkeletalMeshComponent_CachedComponentSpaceTransforms = 0x9B8;
-    constexpr uintptr_t USkeletalMesh_Skeleton = 0xF8;
     constexpr uintptr_t ACharacter_CharacterMovement = 0x330;
     constexpr uintptr_t ACharacter_CapsuleComponent  = 0x338;
     constexpr uintptr_t UCapsuleComponent_CapsuleHalfHeight = 0x540;
@@ -193,8 +187,6 @@ namespace ObjectIndices
     constexpr int32_t UGameInstanceClass        = 0x0807;
     constexpr int32_t UGameViewportClientClass  = 0x0810;
     constexpr int32_t ULocalPlayerClass          = 0x084C;
-    constexpr int32_t USkeletalMeshClass         = 0x08A5;
-    constexpr int32_t USkeletalMeshComponentClass = 0x025A;
     constexpr int32_t SenseStimulusComponentClass = 0x0B01;
     constexpr int32_t IRRBaseCharacterClass      = 0x0FCE;
     constexpr int32_t IRRAIBaseCharacterClass    = 0x0FCF;
@@ -218,7 +210,6 @@ namespace ObjectIndices
     constexpr int32_t Package_ID_MarkedCoin      = 0x0C854;
     constexpr int32_t Package_ID_HealthInjector  = 0x0C85C;
     constexpr int32_t DefaultInventoryFunctionLibrary = 0x0907C;
-    constexpr int32_t DefaultGeneralFunctionLibrary = 0x08F1B;
 }
 
 // Stable UFunction indices from the same updated Dumper-7 object dump. Every call
@@ -232,14 +223,11 @@ namespace FunctionIndices
     constexpr int32_t Actor_GetActorEnableCollision = 0x2926;
     constexpr int32_t Actor_GetActorEyesViewPoint = 0x2927;
     constexpr int32_t Actor_SetActorEnableCollision = 0x2994;
-    constexpr int32_t Controller_GetPlayerViewPoint = 0x29B2;
-    constexpr int32_t Controller_LineOfSightTo = 0x29BA;
     constexpr int32_t Controller_SetControlRotation = 0x29C4;
     constexpr int32_t Controller_SetIgnoreLookInput = 0x29C5;
     constexpr int32_t Controller_SetIgnoreMoveInput = 0x29C6;
     constexpr int32_t Controller_StopMovement = 0x29C8;
     constexpr int32_t EBBarrel_CalculateAimDirectionFromLocation = 0x2B75;
-    constexpr int32_t GeneralFunctionLibrary_CheckSphereVisibility = 0x6F56;
     constexpr int32_t PlayerController_ProjectWorldLocationToScreen = 0x2A36;
     constexpr int32_t CharacterMovementComponent_SetMovementMode = 0x527E;
     constexpr int32_t SenseStimulusComponent_SetInvisibleServer = 0x5FC4;
