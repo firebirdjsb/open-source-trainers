@@ -192,9 +192,11 @@ namespace
             Address("aim controller", a.Controller);
             Address("target character", a.TargetActor);
             Address("target BodyComponent", a.TargetBodyComponent);
-            ImGui::Text("Target: %s | RMB: %s | attempt: %s | mode: %s",
+            ImGui::Text("Target: %s | RMB: %s | LMB: %s | active: %s | attempt: %s",
                 a.TargetFound ? "FOUND" : "NONE", a.RmbHeld ? "DOWN" : "UP",
-                a.AimAttempted ? "YES" : "NO", a.UsedMouseInput ? "MOUSE" : "CONTROL ROTATION");
+                a.LmbHeld ? "DOWN" : "UP", a.ActivationHeld ? "YES" : "NO",
+                a.AimAttempted ? "YES" : "NO");
+            ImGui::Text("Aim mode: %s", a.UsedMouseInput ? "MOUSE" : "CONTROL ROTATION");
             ImGui::Text("Aim submission/write: %s | next-frame rotation changed: %s",
                 a.DirectWriteSucceeded ? "OK" : "NO",
                 a.RotationChangedAfterAttempt ? "YES" : "NO");
@@ -207,9 +209,9 @@ namespace
                     (a.UsedCapsuleFallback ? "CAPSULE FALLBACK" : "VERIFIED BONE"))) : "NONE",
                 a.PoseAwareTargets, a.PoseAwareFailures,
                 a.UsedSetControlRotationFunction ? "CALLED" : "NO");
-            ImGui::Text("Visibility: %s | LOS checks: %d | occluded: %d | target: %s | sticky: %s",
+            ImGui::Text("Visibility: %s | LOS: %d | sphere pass: %d | occluded: %d | target: %s | sticky: %s",
                 a.VisibilityRequired ? "REQUIRED" : "OFF",
-                a.LineOfSightChecks, a.OccludedTargets,
+                a.LineOfSightChecks, a.TargetSpherePasses, a.OccludedTargets,
                 a.TargetVisible ? "VISIBLE" : "NOT CONFIRMED",
                 a.StickyTarget ? "YES" : "NO");
             ImGui::Text("LOS cache: hits %d | pending/miss %d | queued %d | task %s | thread %lu",

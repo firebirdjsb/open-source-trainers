@@ -218,7 +218,8 @@ namespace GameAccess
     // Read-only helper for dump-verified object indices. Returns 0 until the live
     // GUObjectArray has passed the existing structural validation.
     uintptr_t GetObjectByIndex(int32_t objectIndex);
-    bool HasLineOfSight(uintptr_t actor, const FVector& viewPoint, bool& outVisible);
+    bool HasLineOfSight(uintptr_t actor, const FVector& targetPoint,
+                        bool& outVisible, bool* outUsedTargetSphere = nullptr);
     bool GetActorEyesViewPoint(uintptr_t actor, FVector& outLocation);
     // Uses IRRBaseCharacter::BodyComponent so the returned point follows the live
     // animation pose (including crouch/prone) instead of a standing capsule ratio.

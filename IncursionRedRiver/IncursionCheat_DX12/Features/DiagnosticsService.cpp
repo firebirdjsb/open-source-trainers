@@ -254,6 +254,8 @@ namespace DiagnosticsService
         Hex(out, "Target BodyComponent", a.TargetBodyComponent);
         out << "Target found=" << YesNo(a.TargetFound)
             << " RMB=" << YesNo(a.RmbHeld)
+            << " LMB=" << YesNo(a.LmbHeld)
+            << " activation=" << YesNo(a.ActivationHeld)
             << " attempted=" << YesNo(a.AimAttempted)
             << " visible=" << YesNo(a.TargetVisible)
             << " sticky=" << YesNo(a.StickyTarget)
@@ -269,6 +271,7 @@ namespace DiagnosticsService
             << " poseAware=" << a.PoseAwareTargets
             << " poseFailures=" << a.PoseAwareFailures << "\n";
         out << "LOS cache: checks=" << a.LineOfSightChecks
+            << " targetSpherePasses=" << a.TargetSpherePasses
             << " occluded=" << a.OccludedTargets
             << " hits=" << a.VisibilityCacheHits
             << " pending/misses=" << a.VisibilityCacheMisses

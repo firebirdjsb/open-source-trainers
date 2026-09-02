@@ -15,6 +15,8 @@ namespace Aimbot
         FRotator RotationObserved{};
         bool TargetFound = false;
         bool RmbHeld = false;
+        bool LmbHeld = false;
+        bool ActivationHeld = false;
         bool AimAttempted = false;
         bool UsedMouseInput = false;
         bool UsedCapsuleFallback = false;
@@ -46,6 +48,7 @@ namespace Aimbot
         int VisibilityCacheHits = 0;
         int VisibilityCacheMisses = 0;
         int VisibilityQueriesQueued = 0;
+        int TargetSpherePasses = 0;
         uint32_t VisibilitySampleThreadId = 0;
         bool VisibilityTaskPending = false;
     };
@@ -55,6 +58,7 @@ namespace Aimbot
     extern bool bSmoothAim;
     extern bool bUseMouseInput;
     extern bool bVisibilityCheck;
+    extern bool bAimOnFire;
     extern bool bPrediction;
     extern float smoothAmount;
     extern float aimStrength;

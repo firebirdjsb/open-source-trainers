@@ -218,6 +218,7 @@ namespace ObjectIndices
     constexpr int32_t Package_ID_MarkedCoin      = 0x0C854;
     constexpr int32_t Package_ID_HealthInjector  = 0x0C85C;
     constexpr int32_t DefaultInventoryFunctionLibrary = 0x0907C;
+    constexpr int32_t DefaultGeneralFunctionLibrary = 0x08F1B;
 }
 
 // Stable UFunction indices from the same updated Dumper-7 object dump. Every call
@@ -231,12 +232,14 @@ namespace FunctionIndices
     constexpr int32_t Actor_GetActorEnableCollision = 0x2926;
     constexpr int32_t Actor_GetActorEyesViewPoint = 0x2927;
     constexpr int32_t Actor_SetActorEnableCollision = 0x2994;
+    constexpr int32_t Controller_GetPlayerViewPoint = 0x29B2;
     constexpr int32_t Controller_LineOfSightTo = 0x29BA;
     constexpr int32_t Controller_SetControlRotation = 0x29C4;
     constexpr int32_t Controller_SetIgnoreLookInput = 0x29C5;
     constexpr int32_t Controller_SetIgnoreMoveInput = 0x29C6;
     constexpr int32_t Controller_StopMovement = 0x29C8;
     constexpr int32_t EBBarrel_CalculateAimDirectionFromLocation = 0x2B75;
+    constexpr int32_t GeneralFunctionLibrary_CheckSphereVisibility = 0x6F56;
     constexpr int32_t PlayerController_ProjectWorldLocationToScreen = 0x2A36;
     constexpr int32_t CharacterMovementComponent_SetMovementMode = 0x527E;
     constexpr int32_t SenseStimulusComponent_SetInvisibleServer = 0x5FC4;

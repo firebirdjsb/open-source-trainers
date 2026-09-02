@@ -15,6 +15,7 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace
@@ -127,10 +128,19 @@ namespace
 
         ++g_lastSkeletonActors;
         g_lastSkeletonPoints += visiblePoints;
-        const ImU32 boneColor = IM_COL32(255, 205, 80, 225);
+        const ImU32 shadowColor = IM_COL32(0, 0, 0, 190);
+        const ImU32 boneColor = IM_COL32(245, 248, 255, 240);
         const float projectedHeight = std::max(0.0f, maxScreenY - minScreenY);
         const float lineThickness = std::clamp(
-            1.35f + projectedHeight / 180.0f, 1.35f, 2.35f);
+            0.95f + projectedHeight / 320.0f, 1.0f, 1.55f);
+
+        auto drawSegment = [&](const Vector2& from, const Vector2& to)
+        {
+            Renderer::DrawLine(from.x, from.y, to.x, to.y, shadowColor,
+                               lineThickness + 1.8f);
+            Renderer::DrawLine(from.x, from.y, to.x, to.y, boneColor,
+                               lineThickness);
+        };
 
         // Prefer the verified native reference-skeleton parent topology. If Dumper-7
         // cannot prove that native array for a particular mesh, fall back to an
@@ -144,23 +154,23 @@ namespace
             const auto parent = byIndex.find(bones[i].ParentIndex);
             if (parent != byIndex.end() && projected[parent->second].Visible)
             {
-                Renderer::DrawLine(projected[i].Screen.x, projected[i].Screen.y,
-                                   projected[parent->second].Screen.x,
-                                   projected[parent->second].Screen.y, boneColor,
-                                   lineThickness);
+                drawSegment(projected[i].Screen,
+                            projected[parent->second].Screen);
                 ++parentEdges;
             }
         }
 
-        // The optimized IRR pose fallback adds neck/pelvis indices 9/10. Mark its
-        // exact eye/head anchor so distant skeletons still read as attached figures
-        // rather than a few ambiguous arrow-shaped lines.
+        // The IRR pose skeleton adds neck/pelvis indices 9/10. Give its exact eye
+        // anchor a proportional head ring like a conventional skeleton overlay.
         if ((byIndex.find(9) != byIndex.end() || byIndex.find(10) != byIndex.end()))
         {
             const auto head = byIndex.find(0);
             if (head != byIndex.end() && projected[head->second].Visible)
             {
-                const float radius = std::clamp(projectedHeight * 0.045f, 1.8f, 4.5f);
+                const float radius = std::clamp(projectedHeight * 0.075f, 3.0f, 11.0f);
+                Renderer::DrawCircle(projected[head->second].Screen.x,
+                                     projected[head->second].Screen.y,
+                                     radius + 1.5f, shadowColor);
                 Renderer::DrawCircle(projected[head->second].Screen.x,
                                      projected[head->second].Screen.y,
                                      radius, boneColor);
@@ -246,11 +256,8 @@ namespace
                 {
                     if (a < 0 || b < 0 || a == b)
                         return;
-                    Renderer::DrawLine(projected[static_cast<size_t>(a)].Screen.x,
-                                       projected[static_cast<size_t>(a)].Screen.y,
-                                       projected[static_cast<size_t>(b)].Screen.x,
-                                       projected[static_cast<size_t>(b)].Screen.y,
-                                       boneColor, lineThickness);
+                    drawSegment(projected[static_cast<size_t>(a)].Screen,
+                                projected[static_cast<size_t>(b)].Screen);
                 };
                 line(head, neck);
                 line(neck, chest);
@@ -410,9 +417,16 @@ namespace ESP
             ++g_lastRenderedCount;
             if (bDrawSkeleton && candidate.DistanceMeters <= skeletonDistanceMeters)
             {
-                auto bones = GameAccess::GetBonePoints(candidate.Actor);
+                // Prefer IRR's named, live body-part sample. The generic mesh cache
+                // can expose only a tiny partial parent chain for these NPC meshes,
+                // which was the arrow-shaped overlay seen in testing.
+                auto bones = GameAccess::GetCachedPoseSkeleton(candidate.Actor);
                 if (bones.empty())
-                    bones = GameAccess::GetCachedPoseSkeleton(candidate.Actor);
+                {
+                    auto nativeBones = GameAccess::GetBonePoints(candidate.Actor);
+                    if (nativeBones.size() >= 8)
+                        bones = std::move(nativeBones);
+                }
                 DrawBoneSkeleton(bones, camera, width, height);
             }
 

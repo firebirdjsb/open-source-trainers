@@ -1957,27 +1957,68 @@ namespace GameAccess
                outName.IsValid();
     }
 
-    bool HasLineOfSight(uintptr_t actor, const FVector& viewPoint, bool& outVisible)
+    bool HasLineOfSight(uintptr_t actor, const FVector& targetPoint,
+                        bool& outVisible, bool* outUsedTargetSphere)
     {
         outVisible = false;
+        if (outUsedTargetSphere)
+            *outUsedTargetSphere = false;
         const uintptr_t controller = GetLocalController();
-        if (!controller || !actor || !viewPoint.IsFinite())
+        if (!controller || !actor || !targetPoint.IsFinite())
             return false;
+
+        // A zero ViewPoint tells AController::LineOfSightTo to obtain its own
+        // authoritative eye position. Passing the render-camera snapshot here was
+        // subtly wrong: the request is dispatched to the game thread later, so that
+        // snapshot can belong to an older frame and reject an otherwise exposed pawn.
         alignas(8) uint8_t params[0x28]{};
         std::memcpy(params + 0x00, &actor, sizeof(actor));
-        std::memcpy(params + 0x08, &viewPoint, sizeof(viewPoint));
-        // The full UE pass checks the target plus its native pawn head/side points,
-        // avoiding origin-only false negatives at low cover and terrain edges.
-        // false performs the full target/head/side-point path. In UE's native
-        // implementation AlternateChecks is a reduced-cost alternate pass, not an
-        // instruction to add more traces; enabling it caused open targets to be
-        // rejected depending on the controller's alternating LOS state.
         params[0x20] = 0;
-        // ReturnValue is @ 0x21.
-        if (!InvokeFunctionRaw(controller, FunctionIndices::Controller_LineOfSightTo,
-                               params, sizeof(params)))
-            return false;
-        outVisible = params[0x21] != 0;
+        const bool actorLosCalled = InvokeFunctionRaw(controller,
+            FunctionIndices::Controller_LineOfSightTo, params, sizeof(params));
+        if (actorLosCalled && params[0x21] != 0)
+        {
+            outVisible = true;
+            return true;
+        }
+
+        // LineOfSightTo primarily reasons about the actor origin and its generic
+        // pawn probes. IRR exposes a purpose-built sphere visibility helper, so use
+        // it for the exact selected live-pose point when the actor-level pass says
+        // no. This fixes low-cover/crouch false negatives while still performing a
+        // collision trace; it is not a WasRecentlyRendered or fail-open shortcut.
+        alignas(8) uint8_t viewParams[0x30]{};
+        FVector observer{};
+        if (!InvokeFunctionRaw(controller,
+                FunctionIndices::Controller_GetPlayerViewPoint,
+                viewParams, sizeof(viewParams)))
+            return actorLosCalled;
+        std::memcpy(&observer, viewParams, sizeof(observer));
+        if (!observer.IsFinite())
+            return actorLosCalled;
+
+        const uintptr_t world = GetWorld();
+        const uintptr_t library = GetObjectByIndex(
+            ObjectIndices::DefaultGeneralFunctionLibrary);
+        if (!world || !library)
+            return actorLosCalled;
+
+        alignas(8) uint8_t sphereParams[0x48]{};
+        constexpr float ProbeRadiusCm = 14.0f;
+        constexpr int32_t ProbeRayCount = 5;
+        std::memcpy(sphereParams + 0x00, &world, sizeof(world));
+        std::memcpy(sphereParams + 0x08, &observer, sizeof(observer));
+        std::memcpy(sphereParams + 0x20, &targetPoint, sizeof(targetPoint));
+        std::memcpy(sphereParams + 0x38, &ProbeRadiusCm, sizeof(ProbeRadiusCm));
+        std::memcpy(sphereParams + 0x3C, &ProbeRayCount, sizeof(ProbeRayCount));
+        if (!InvokeFunctionRaw(library,
+                FunctionIndices::GeneralFunctionLibrary_CheckSphereVisibility,
+                sphereParams, sizeof(sphereParams)))
+            return actorLosCalled;
+
+        outVisible = sphereParams[0x40] != 0;
+        if (outUsedTargetSphere)
+            *outUsedTargetSphere = outVisible;
         return true;
     }
 
@@ -2258,12 +2299,15 @@ namespace GameAccess
         if (!GetActorLocation(actor, currentLocation))
             return {};
         const FVector delta = currentLocation - cached.ActorLocation;
-        // Head, thorax, stomach, right/left arm, right/left leg, right/left foot,
-        // followed by synthetic neck and pelvis joints. The synthetic joints only
-        // connect exact sampled anchors; they do not invent detached world points.
-        constexpr std::array<int32_t, 9> parents = { 9, 2, 10, 1, 1, 10, 10, 5, 6 };
+        // Head, thorax, stomach, right/left arm, right/left leg and right/left foot.
+        // The body-component points are pose-correct; small interpolated shoulder,
+        // neck, pelvis and hand endpoints below turn those sparse gameplay hit
+        // anchors into a readable full-body stick figure.
+        constexpr std::array<int32_t, 9> parents = {
+            9, 2, 10, 11, 12, 10, 10, 5, 6
+        };
         std::vector<BonePoint> points;
-        points.reserve(11);
+        points.reserve(15);
         for (int32_t index = 0; index < 9; ++index)
         {
             if ((cached.ValidMask & static_cast<uint16_t>(1u << index)) == 0)
@@ -2274,22 +2318,46 @@ namespace GameAccess
             points.push_back({ index, parents[static_cast<size_t>(index)],
                                worldPoint - currentLocation, worldPoint });
         }
-        FVector head{}, thorax{}, stomach{}, rightLeg{}, leftLeg{};
+        auto addJoint = [&](int32_t index, int32_t parent, const FVector& worldPoint)
+        {
+            if (worldPoint.IsFinite() && worldPoint.Distance(currentLocation) < 275.0)
+                points.push_back({ index, parent, worldPoint - currentLocation,
+                                   worldPoint });
+        };
+
+        FVector head{}, thorax{}, stomach{}, rightArm{}, leftArm{};
+        FVector rightLeg{}, leftLeg{};
         const bool haveHead = PoseTargetFromEntry(cached, "head", delta, head);
         const bool haveThorax = PoseTargetFromEntry(cached, "chest", delta, thorax);
         const bool haveStomach = PoseTargetFromEntry(cached, "stomach", delta, stomach);
+        const bool haveRightArm = PoseTargetFromEntry(cached, "arm_r", delta, rightArm);
+        const bool haveLeftArm = PoseTargetFromEntry(cached, "arm_l", delta, leftArm);
         const bool haveRightLeg = PoseTargetFromEntry(cached, "leg_r", delta, rightLeg);
         const bool haveLeftLeg = PoseTargetFromEntry(cached, "leg_l", delta, leftLeg);
         if (haveHead && haveThorax)
         {
             const FVector neck = thorax + (head - thorax) * 0.68;
-            points.push_back({ 9, 1, neck - currentLocation, neck });
+            addJoint(9, 1, neck);
         }
         if (haveStomach && haveRightLeg && haveLeftLeg)
         {
             const FVector hipCenter = (rightLeg + leftLeg) * 0.5;
             const FVector pelvis = stomach + (hipCenter - stomach) * 0.42;
-            points.push_back({ 10, -1, pelvis - currentLocation, pelvis });
+            addJoint(10, -1, pelvis);
+        }
+        if (haveThorax && haveRightArm)
+        {
+            const FVector shoulder = thorax + (rightArm - thorax) * 0.32;
+            addJoint(11, 1, shoulder);
+            const FVector hand = rightArm + (rightArm - shoulder) * 0.72;
+            addJoint(13, 3, hand);
+        }
+        if (haveThorax && haveLeftArm)
+        {
+            const FVector shoulder = thorax + (leftArm - thorax) * 0.32;
+            addJoint(12, 1, shoulder);
+            const FVector hand = leftArm + (leftArm - shoulder) * 0.72;
+            addJoint(14, 4, hand);
         }
         return points;
     }
