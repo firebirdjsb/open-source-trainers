@@ -153,7 +153,12 @@ namespace
     bool g_imguiDx12 = false;
     bool g_menuOpenLastFrame = false;
     std::mutex g_gameTaskMutex;
-    std::deque<std::function<void()>> g_gameTasks;
+    struct GameThreadTask
+    {
+        std::function<void()> Callback;
+        bool LogExecution = true;
+    };
+    std::deque<GameThreadTask> g_gameTasks;
     std::atomic<DWORD> g_gameWindowThreadId{ 0 };
     std::atomic<DWORD> g_lastGameTaskThreadId{ 0 };
 
@@ -292,7 +297,7 @@ namespace
 
     void DrainGameThreadTasks()
     {
-        std::deque<std::function<void()>> tasks;
+        std::deque<GameThreadTask> tasks;
         {
             std::lock_guard<std::mutex> lock(g_gameTaskMutex);
             tasks.swap(g_gameTasks);
@@ -302,10 +307,14 @@ namespace
 
         const DWORD threadId = GetCurrentThreadId();
         g_lastGameTaskThreadId.store(threadId);
-        DebugLog("[GameTask] Executing %zu queued operation(s) on window/game thread %lu.\n",
-            tasks.size(), static_cast<unsigned long>(threadId));
+        const size_t loggedTasks = static_cast<size_t>(std::count_if(
+            tasks.begin(), tasks.end(), [](const GameThreadTask& task)
+            { return task.LogExecution; }));
+        if (loggedTasks)
+            DebugLog("[GameTask] Executing %zu queued operation(s) on window/game thread %lu.\n",
+                loggedTasks, static_cast<unsigned long>(threadId));
         for (auto& task : tasks)
-            if (task) task();
+            if (task.Callback) task.Callback();
     }
 
     LRESULT CALLBACK HookWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -973,7 +982,7 @@ bool IsHookInstalled() { return g_hookInstalled.load(); }
 bool IsRendererInitialized() { return g_rendererInitialized.load(); }
 bool HasCapturedCommandQueue() { return g_gameQueue.load() != nullptr; }
 
-bool QueueGameThreadTask(std::function<void()> task)
+bool QueueGameThreadTask(std::function<void()> task, bool logExecution)
 {
     if (!task || g_shuttingDown.load())
         return false;
@@ -984,7 +993,7 @@ bool QueueGameThreadTask(std::function<void()> task)
 
     {
         std::lock_guard<std::mutex> lock(g_gameTaskMutex);
-        g_gameTasks.emplace_back(std::move(task));
+        g_gameTasks.push_back({ std::move(task), logExecution });
         if (!PostMessageW(hwnd, WmRunGameThreadTasks, 0, 0))
         {
             g_gameTasks.pop_back();

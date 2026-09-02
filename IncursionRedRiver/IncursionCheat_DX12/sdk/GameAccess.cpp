@@ -6,9 +6,11 @@
 
 #include <Windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -93,6 +95,15 @@ namespace
         bool Valid = false;
     };
 
+    struct PoseCacheEntry
+    {
+        std::array<FVector, 9> Parts{};
+        FVector ActorLocation{};
+        uintptr_t BodyComponent = 0;
+        ULONGLONG SampledAt = 0;
+        uint16_t ValidMask = 0;
+    };
+
     GameAccess::RuntimeDiagnostics g_diag{};
     GameAccess::BoneDiagnostics g_lastBoneDiag{};
     ObjectArrayLayout g_objects{};
@@ -117,6 +128,16 @@ namespace
     std::unordered_set<uintptr_t> g_hostileCharacters;
     std::unordered_map<uintptr_t, BoneCacheEntry> g_boneCache;
     std::unordered_map<uintptr_t, ParentCacheEntry> g_parentCache;
+    std::unordered_map<uintptr_t, PoseCacheEntry> g_poseCache;
+    std::unordered_set<uintptr_t> g_poseQueuedActors;
+    std::mutex g_poseCacheMutex;
+    std::atomic<bool> g_poseTaskPending{ false };
+    std::atomic<uint32_t> g_poseLastSampleThreadId{ 0 };
+    std::atomic<int32_t> g_poseLastRequestedActors{ 0 };
+    std::atomic<int32_t> g_poseLastSampledActors{ 0 };
+    std::atomic<ULONGLONG> g_poseLastCompletedAt{ 0 };
+    ULONGLONG g_lastPoseRequestAt = 0;
+    uintptr_t g_poseCacheWorld = 0;
     std::unordered_map<ClassPair, bool, ClassPairHash> g_isAResultCache;
     std::unordered_map<uintptr_t, uint16_t> g_classKindCache;
     ULONGLONG g_lastObjectRefresh = 0;
@@ -154,6 +175,96 @@ namespace
     bool g_hasRuntimeLog = false;
 
     bool ClassIsChildOf(uintptr_t objectClass, uintptr_t targetClass);
+    bool IsObjectOfClass(uintptr_t object, uintptr_t targetClass);
+
+    bool ReadBodyPoseDirect(uintptr_t actor, PoseCacheEntry& out)
+    {
+        out = {};
+        if (!actor || !GameAccess::IsIRRCharacter(actor) ||
+            !GameAccess::GetActorLocation(actor, out.ActorLocation))
+            return false;
+
+        const uintptr_t body = Memory::Read<uintptr_t>(actor +
+            Offsets::IRRBaseCharacter_BodyComponent);
+        if (!body || !IsObjectOfClass(body, g_classes.IRRBodyComponent))
+            return false;
+        out.BodyComponent = body;
+
+        auto plausible = [&](const FVector& point)
+        {
+            return point.IsFinite() && point.Distance(out.ActorLocation) < 500.0;
+        };
+
+        // Head uses the exact eye anchor also used by aim assist. The remaining
+        // entries follow EIRRBodyPart declaration order (Thorax through LeftFoot).
+        alignas(8) uint8_t eyeParams[0x18]{};
+        if (GameAccess::InvokeFunctionRaw(body,
+                FunctionIndices::IRRBodyComponent_GetEyeLocation,
+                eyeParams, sizeof(eyeParams)))
+        {
+            FVector eye{};
+            std::memcpy(&eye, eyeParams, sizeof(eye));
+            if (plausible(eye))
+            {
+                out.Parts[0] = eye;
+                out.ValidMask |= 1u;
+            }
+        }
+
+        for (uint8_t part = 1; part <= 8; ++part)
+        {
+            alignas(8) uint8_t params[0x20]{};
+            params[0] = part;
+            if (!GameAccess::InvokeFunctionRaw(body,
+                    FunctionIndices::IRRBodyComponent_GetBodyPartLocation,
+                    params, sizeof(params)))
+                continue;
+            FVector point{};
+            std::memcpy(&point, params + 0x08, sizeof(point));
+            if (!plausible(point))
+                continue;
+            out.Parts[part] = point;
+            out.ValidMask |= static_cast<uint16_t>(1u << part);
+        }
+
+        out.SampledAt = GetTickCount64();
+        return (out.ValidMask & 0x007u) == 0x007u &&
+               (out.ValidMask & 0x1F8u) != 0;
+    }
+
+    bool PoseTargetFromEntry(const PoseCacheEntry& entry,
+                             const std::string& targetName,
+                             const FVector& locationDelta,
+                             FVector& out)
+    {
+        auto get = [&](int index, FVector& point)
+        {
+            if (index < 0 || index >= 9 ||
+                (entry.ValidMask & static_cast<uint16_t>(1u << index)) == 0)
+                return false;
+            point = entry.Parts[static_cast<size_t>(index)] + locationDelta;
+            return point.IsFinite();
+        };
+
+        if (targetName == "head") return get(0, out);
+        if (targetName == "neck")
+        {
+            FVector eye{}, thorax{};
+            if (!get(0, eye) || !get(1, thorax))
+                return false;
+            out = thorax + (eye - thorax) * 0.68;
+            return out.IsFinite();
+        }
+        if (targetName == "chest") return get(1, out);
+        if (targetName == "stomach" || targetName == "pelvis") return get(2, out);
+        if (targetName == "arm_r" || targetName == "hand_r") return get(3, out);
+        if (targetName == "arm_l" || targetName == "hand_l") return get(4, out);
+        if (targetName == "leg_r") return get(5, out);
+        if (targetName == "leg_l") return get(6, out);
+        if (targetName == "foot_r") return get(7, out);
+        if (targetName == "foot_l") return get(8, out);
+        return false;
+    }
 
     enum ClassKind : uint16_t
     {
@@ -1114,6 +1225,18 @@ namespace GameAccess
         g_staminaAttributes.clear();
         g_boneCache.clear();
         g_parentCache.clear();
+        {
+            std::lock_guard<std::mutex> lock(g_poseCacheMutex);
+            g_poseCache.clear();
+            g_poseQueuedActors.clear();
+            g_poseCacheWorld = 0;
+        }
+        g_poseTaskPending.store(false);
+        g_poseLastSampleThreadId.store(0);
+        g_poseLastRequestedActors.store(0);
+        g_poseLastSampledActors.store(0);
+        g_poseLastCompletedAt.store(0);
+        g_lastPoseRequestAt = 0;
         g_isAResultCache.clear();
         g_classKindCache.clear();
         g_lastObjectRefresh = 0;
@@ -1557,6 +1680,20 @@ namespace GameAccess
 
     const RuntimeDiagnostics& GetDiagnostics() { return g_diag; }
     const BoneDiagnostics& GetBoneDiagnostics() { return g_lastBoneDiag; }
+    PoseCacheDiagnostics GetPoseCacheDiagnostics()
+    {
+        PoseCacheDiagnostics out{};
+        {
+            std::lock_guard<std::mutex> lock(g_poseCacheMutex);
+            out.CachedActors = static_cast<int32_t>(g_poseCache.size());
+        }
+        out.LastRequestedActors = g_poseLastRequestedActors.load();
+        out.LastSampledActors = g_poseLastSampledActors.load();
+        out.LastCompletedAt = g_poseLastCompletedAt.load();
+        out.LastSampleThreadId = g_poseLastSampleThreadId.load();
+        out.TaskPending = g_poseTaskPending.load();
+        return out;
+    }
     uintptr_t GetWorld() { return g_diag.World; }
     uintptr_t GetPersistentLevel() { return g_diag.PersistentLevel; }
     uintptr_t GetGameInstance() { return g_diag.GameInstance; }
@@ -1722,12 +1859,13 @@ namespace GameAccess
         alignas(8) uint8_t params[0x28]{};
         std::memcpy(params + 0x00, &actor, sizeof(actor));
         std::memcpy(params + 0x08, &viewPoint, sizeof(viewPoint));
-        // The primary UE trace targets the actor origin, which is frequently hidden
-        // by low terrain, cover edges, or the floor even when the enemy's upper body
-        // is fully visible. AlternateChecks asks AController::LineOfSightTo to try
-        // its additional pawn eye/side points. This preserves wall rejection while
-        // preventing open or partially exposed enemies from being false negatives.
-        params[0x20] = 1;
+        // The full UE pass checks the target plus its native pawn head/side points,
+        // avoiding origin-only false negatives at low cover and terrain edges.
+        // false performs the full target/head/side-point path. In UE's native
+        // implementation AlternateChecks is a reduced-cost alternate pass, not an
+        // instruction to add more traces; enabling it caused open targets to be
+        // rejected depending on the controller's alternating LOS state.
+        params[0x20] = 0;
         // ReturnValue is @ 0x21.
         if (!InvokeFunctionRaw(controller, FunctionIndices::Controller_LineOfSightTo,
                                params, sizeof(params)))
@@ -1741,6 +1879,9 @@ namespace GameAccess
         outLocation = {};
         if (!actor)
             return false;
+        const DWORD windowThread = GetGameWindowThreadId();
+        if (windowThread && GetCurrentThreadId() != windowThread)
+            return GetPoseAwareBodyTarget(actor, "head", outLocation);
         alignas(8) uint8_t params[0x30]{};
         if (!InvokeFunctionRaw(actor, FunctionIndices::Actor_GetActorEyesViewPoint,
                                params, sizeof(params)))
@@ -1757,6 +1898,26 @@ namespace GameAccess
             *outBodyComponent = 0;
         if (!actor || !IsIRRCharacter(actor))
             return false;
+
+        const DWORD windowThread = GetGameWindowThreadId();
+        if (windowThread && GetCurrentThreadId() != windowThread)
+        {
+            PoseCacheEntry cached{};
+            {
+                std::lock_guard<std::mutex> lock(g_poseCacheMutex);
+                const auto found = g_poseCache.find(actor);
+                if (found == g_poseCache.end() || !found->second.SampledAt ||
+                    GetTickCount64() - found->second.SampledAt > 500)
+                    return false;
+                cached = found->second;
+            }
+            FVector currentLocation{};
+            const FVector delta = GetActorLocation(actor, currentLocation) ?
+                currentLocation - cached.ActorLocation : FVector{};
+            if (outBodyComponent)
+                *outBodyComponent = cached.BodyComponent;
+            return PoseTargetFromEntry(cached, targetName, delta, outLocation);
+        }
 
         const uintptr_t body = Memory::Read<uintptr_t>(actor +
             Offsets::IRRBaseCharacter_BodyComponent);
@@ -1841,6 +2002,123 @@ namespace GameAccess
         return false;
     }
 
+    bool RequestPoseSamples(const std::vector<uintptr_t>& actors,
+                            uint32_t minimumIntervalMs)
+    {
+        if (actors.empty() || !GetGameWindowThreadId())
+            return false;
+
+        const ULONGLONG now = GetTickCount64();
+        const uintptr_t world = GetWorld();
+        {
+            std::lock_guard<std::mutex> lock(g_poseCacheMutex);
+            if (g_poseCacheWorld != world)
+            {
+                g_poseCache.clear();
+                g_poseQueuedActors.clear();
+                g_poseCacheWorld = world;
+            }
+            for (const uintptr_t actor : actors)
+            {
+                if (actor && g_poseQueuedActors.size() < 32)
+                    g_poseQueuedActors.insert(actor);
+            }
+        }
+        if (g_poseTaskPending.load())
+            return true;
+        if (g_lastPoseRequestAt && now - g_lastPoseRequestAt < minimumIntervalMs)
+            return true;
+
+        std::vector<uintptr_t> requested;
+        {
+            std::lock_guard<std::mutex> lock(g_poseCacheMutex);
+            requested.reserve(std::min<size_t>(g_poseQueuedActors.size(), 16));
+            for (auto it = g_poseQueuedActors.begin();
+                 it != g_poseQueuedActors.end() && requested.size() < 16;)
+            {
+                requested.push_back(*it);
+                it = g_poseQueuedActors.erase(it);
+            }
+        }
+        if (requested.empty())
+            return false;
+
+        g_lastPoseRequestAt = now;
+        g_poseLastRequestedActors.store(static_cast<int32_t>(requested.size()));
+        g_poseTaskPending.store(true);
+        if (!QueueGameThreadTask([requested = std::move(requested), world]()
+            {
+                std::vector<std::pair<uintptr_t, PoseCacheEntry>> completed;
+                completed.reserve(requested.size());
+                for (const uintptr_t actor : requested)
+                {
+                    PoseCacheEntry sample{};
+                    if (ReadBodyPoseDirect(actor, sample))
+                        completed.emplace_back(actor, sample);
+                }
+
+                const ULONGLONG completedAt = GetTickCount64();
+                {
+                    std::lock_guard<std::mutex> lock(g_poseCacheMutex);
+                    if (g_poseCacheWorld == world)
+                    {
+                        for (const auto& item : completed)
+                            g_poseCache[item.first] = item.second;
+                        for (auto it = g_poseCache.begin(); it != g_poseCache.end();)
+                        {
+                            if (!it->second.SampledAt ||
+                                completedAt - it->second.SampledAt > 2000)
+                                it = g_poseCache.erase(it);
+                            else
+                                ++it;
+                        }
+                    }
+                }
+                g_poseLastSampledActors.store(static_cast<int32_t>(completed.size()));
+                g_poseLastSampleThreadId.store(GetCurrentThreadId());
+                g_poseLastCompletedAt.store(completedAt);
+                g_poseTaskPending.store(false);
+            }, false))
+        {
+            g_poseTaskPending.store(false);
+            return false;
+        }
+        return true;
+    }
+
+    std::vector<BonePoint> GetCachedPoseSkeleton(uintptr_t actor,
+                                                 uint32_t maximumAgeMs)
+    {
+        PoseCacheEntry cached{};
+        {
+            std::lock_guard<std::mutex> lock(g_poseCacheMutex);
+            const auto found = g_poseCache.find(actor);
+            if (found == g_poseCache.end() || !found->second.SampledAt ||
+                GetTickCount64() - found->second.SampledAt > maximumAgeMs)
+                return {};
+            cached = found->second;
+        }
+
+        FVector currentLocation{};
+        const FVector delta = GetActorLocation(actor, currentLocation) ?
+            currentLocation - cached.ActorLocation : FVector{};
+        // Head, thorax, stomach, right/left arm, right/left leg, right/left foot.
+        constexpr std::array<int32_t, 9> parents = { 1, 2, -1, 1, 1, 2, 2, 5, 6 };
+        std::vector<BonePoint> points;
+        points.reserve(9);
+        for (int32_t index = 0; index < 9; ++index)
+        {
+            if ((cached.ValidMask & static_cast<uint16_t>(1u << index)) == 0)
+                continue;
+            const FVector worldPoint = cached.Parts[static_cast<size_t>(index)] + delta;
+            if (!worldPoint.IsFinite())
+                continue;
+            points.push_back({ index, parents[static_cast<size_t>(index)],
+                               worldPoint - currentLocation, worldPoint });
+        }
+        return points;
+    }
+
     bool GetActorVelocity(uintptr_t actor, FVector& outVelocity)
     {
         outVelocity = {};
@@ -1878,7 +2156,9 @@ namespace GameAccess
         const uintptr_t barrel = GetBallisticBarrel();
         const uintptr_t bulletClass = barrel ? Memory::Read<uintptr_t>(barrel +
             Offsets::EBBarrel_ChamberedBullet) : 0;
-        if (barrel && bulletClass)
+        const DWORD windowThread = GetGameWindowThreadId();
+        if (barrel && bulletClass &&
+            (!windowThread || GetCurrentThreadId() == windowThread))
         {
             struct alignas(8) Params
             {

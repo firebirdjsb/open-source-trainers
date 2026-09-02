@@ -12,7 +12,7 @@ bool HasCapturedCommandQueue();
 // Present executes on Unreal's render/RHI path. UObject mutations that can
 // create UI render targets must instead be posted to the thread that owns the
 // game window (the UE game thread in this build).
-bool QueueGameThreadTask(std::function<void()> task);
+bool QueueGameThreadTask(std::function<void()> task, bool logExecution = true);
 unsigned long GetGameWindowThreadId();
 unsigned long GetLastGameTaskThreadId();
 

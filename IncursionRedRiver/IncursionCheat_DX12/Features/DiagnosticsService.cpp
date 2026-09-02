@@ -148,12 +148,15 @@ namespace DiagnosticsService
 
             float staminaCurrent = 0.0f;
             float staminaMax = 0.0f;
-            const bool staminaCurOk = GameAccess::QueryFloatFunction(
-                attribute, FunctionIndices::SimpleGameplayAttribute_GetCurrentValue, staminaCurrent);
-            const bool staminaMaxOk = GameAccess::QueryFloatFunction(
-                attribute, FunctionIndices::SimpleGameplayAttribute_GetCurrentMaxValue, staminaMax);
-            out << "  reflected values: current=" << staminaCurrent << " (" << YesNo(staminaCurOk)
-                << ") max=" << staminaMax << " (" << YesNo(staminaMaxOk) << ")\n";
+            const bool staminaCurOk = Memory::TryRead(attribute +
+                Offsets::SimpleGameplayAttribute_CurrentData +
+                Offsets::SimpleAttributeData_BaseValue, staminaCurrent);
+            const bool staminaMaxOk = Memory::TryRead(attribute +
+                Offsets::SimpleGameplayAttribute_CurrentData +
+                Offsets::SimpleAttributeData_MaxValue, staminaMax);
+            out << "  raw current-data snapshot: value=" << staminaCurrent << " ("
+                << YesNo(staminaCurOk) << ") max=" << staminaMax << " ("
+                << YesNo(staminaMaxOk) << ")\n";
         }
         out << "Infinite stamina implementation: SAFE reflected SetBaseValue only; raw stamina writes disabled.\n";
 
@@ -193,6 +196,7 @@ namespace DiagnosticsService
 
         out << "\n=== SKELETAL / BONE CACHE ===\n";
         const auto& b = GameAccess::GetBoneDiagnostics();
+        const auto pose = GameAccess::GetPoseCacheDiagnostics();
         out << "Validated independent bones: actors=" << d.ValidatedBoneActorCount
             << " points=" << d.ValidatedBonePointCount << "\n";
         Hex(out, "Diagnosed actor", b.Actor);
@@ -203,6 +207,11 @@ namespace DiagnosticsService
         out << "Transforms: " << b.TransformCount << '/' << b.TransformCapacity
             << " | array valid: " << YesNo(b.TransformArrayValid)
             << " | mesh type valid: " << YesNo(b.MeshTypeValid) << "\n";
+        out << "Budgeted live-pose cache: actors=" << pose.CachedActors
+            << " sampled/requested=" << pose.LastSampledActors << '/'
+            << pose.LastRequestedActors << " pending=" << YesNo(pose.TaskPending)
+            << " sampleThread=" << pose.LastSampleThreadId
+            << " lastCompletedTick=" << pose.LastCompletedAt << "\n";
         Hex(out, "Parent array", b.ParentArray);
         out << "Parents: count=" << b.ParentCount << " stride=0x" << std::hex
             << b.ParentInfoStride << " field=+0x" << b.ParentFieldOffset << std::dec
@@ -221,12 +230,17 @@ namespace DiagnosticsService
             const bool locationOk = GameAccess::GetActorLocation(actor, location);
             const bool enemy = GameAccess::IsEnemyCharacter(actor);
             const bool living = GameAccess::IsLivingCharacter(actor);
-            const auto bones = GameAccess::GetBonePoints(actor, 256);
+            auto bones = GameAccess::GetBonePoints(actor, 256);
+            const bool rawBones = !bones.empty();
+            if (bones.empty())
+                bones = GameAccess::GetCachedPoseSkeleton(actor);
             out << '[' << dumped << "] actor=0x" << std::hex << actor << std::dec
                 << " enemy=" << YesNo(enemy) << " living=" << YesNo(living)
                 << " locValid=" << YesNo(locationOk)
                 << " location={" << location.X << ',' << location.Y << ',' << location.Z << '}'
-                << " bonePoints=" << bones.size() << "\n";
+                << " bonePoints=" << bones.size()
+                << " boneSource=" << (rawBones ? "raw component transforms" :
+                    (bones.empty() ? "none" : "IRR body live-pose cache")) << "\n";
             ++dumped;
         }
 
@@ -251,6 +265,13 @@ namespace DiagnosticsService
             << " verifiedBones=" << a.VerifiedBoneTargets
             << " poseAware=" << a.PoseAwareTargets
             << " poseFailures=" << a.PoseAwareFailures << "\n";
+        out << "LOS cache: checks=" << a.LineOfSightChecks
+            << " occluded=" << a.OccludedTargets
+            << " hits=" << a.VisibilityCacheHits
+            << " pending/misses=" << a.VisibilityCacheMisses
+            << " queued=" << a.VisibilityQueriesQueued
+            << " taskPending=" << YesNo(a.VisibilityTaskPending)
+            << " sampleThread=" << a.VisibilitySampleThreadId << "\n";
         out << "Target world={" << a.TargetWorld.X << ',' << a.TargetWorld.Y << ','
             << a.TargetWorld.Z << "} velocity={" << a.TargetVelocity.X << ','
             << a.TargetVelocity.Y << ',' << a.TargetVelocity.Z << "}\n";

@@ -70,6 +70,16 @@ namespace GameAccess
         bool ParentIndicesValid = false;
     };
 
+    struct PoseCacheDiagnostics
+    {
+        int32_t CachedActors = 0;
+        int32_t LastRequestedActors = 0;
+        int32_t LastSampledActors = 0;
+        uint64_t LastCompletedAt = 0;
+        uint32_t LastSampleThreadId = 0;
+        bool TaskPending = false;
+    };
+
     struct RuntimeDiagnostics
     {
         uint64_t Serial = 0;
@@ -171,6 +181,7 @@ namespace GameAccess
 
     const RuntimeDiagnostics& GetDiagnostics();
     const BoneDiagnostics& GetBoneDiagnostics();
+    PoseCacheDiagnostics GetPoseCacheDiagnostics();
     const char* SourceName(Source source);
 
     uintptr_t GetWorld();
@@ -212,6 +223,13 @@ namespace GameAccess
     bool GetPoseAwareBodyTarget(uintptr_t actor, const std::string& targetName,
                                 FVector& outLocation,
                                 uintptr_t* outBodyComponent = nullptr);
+    // Budgeted living AI frequently leave the base component-space transform array
+    // empty. Sample the game's authoritative IRRBodyComponent pose on the window/game
+    // thread, then serve immutable cached points to Present/ESP/aim acquisition.
+    bool RequestPoseSamples(const std::vector<uintptr_t>& actors,
+                            uint32_t minimumIntervalMs = 75);
+    std::vector<BonePoint> GetCachedPoseSkeleton(uintptr_t actor,
+                                                 uint32_t maximumAgeMs = 500);
     bool GetActorVelocity(uintptr_t actor, FVector& outVelocity);
     bool PredictBallisticAim(const FVector& start, const FVector& target,
                              const FVector& targetVelocity, float maxTime,

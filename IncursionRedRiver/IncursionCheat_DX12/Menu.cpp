@@ -22,6 +22,12 @@ namespace
     char g_diagnosticDumpPath[520] = "Not written this session.";
     bool g_diagnosticDumpOk = false;
 
+    void WriteDiagnosticDump()
+    {
+        g_diagnosticDumpOk = DiagnosticsService::WriteFullDump(
+            g_diagnosticDumpPath, sizeof(g_diagnosticDumpPath));
+    }
+
     void Address(const char* label, uintptr_t value)
     {
         ImGui::Text("%-30s 0x%016llX", label,
@@ -30,9 +36,11 @@ namespace
 
     void RenderDiagnostics()
     {
-        if (ImGui::Button("WRITE FULL DIAGNOSTIC DUMP", ImVec2(250.0f, 34.0f)))
-            g_diagnosticDumpOk = DiagnosticsService::WriteFullDump(
-                g_diagnosticDumpPath, sizeof(g_diagnosticDumpPath));
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.08f, 0.42f, 0.68f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.10f, 0.54f, 0.82f, 1.00f));
+        if (ImGui::Button("CREATE FULL RUNTIME DUMP", ImVec2(270.0f, 38.0f)))
+            WriteDiagnosticDump();
+        ImGui::PopStyleColor(2);
         ImGui::SameLine();
         ImGui::TextColored(g_diagnosticDumpOk ?
             ImVec4(0.35f, 0.95f, 0.62f, 1.0f) : ImVec4(0.90f, 0.72f, 0.35f, 1.0f),
@@ -147,6 +155,7 @@ namespace
         if (ImGui::CollapsingHeader("Skeletal cache", ImGuiTreeNodeFlags_DefaultOpen))
         {
             const auto& b = GameAccess::GetBoneDiagnostics();
+            const auto pose = GameAccess::GetPoseCacheDiagnostics();
             ImGui::Text("Independent validation: %d actors / %d points",
                 d.ValidatedBoneActorCount, d.ValidatedBonePointCount);
             Address("diagnosed character", b.Actor);
@@ -159,6 +168,10 @@ namespace
             ImGui::Text("CachedTransforms: %d / %d | validation: %s",
                 b.TransformCount, b.TransformCapacity,
                 b.TransformArrayValid ? "OK" : "FAILED");
+            ImGui::Text("Budgeted live-pose cache: %d actors | last %d/%d | %s | thread %lu",
+                pose.CachedActors, pose.LastSampledActors, pose.LastRequestedActors,
+                pose.TaskPending ? "SAMPLING" : "READY",
+                static_cast<unsigned long>(pose.LastSampleThreadId));
             Address("reference parent array", b.ParentArray);
             ImGui::Text("Parents: count %d, stride 0x%X, field +0x%X | %s",
                 b.ParentCount, b.ParentInfoStride, b.ParentFieldOffset,
@@ -197,6 +210,11 @@ namespace
                 a.LineOfSightChecks, a.OccludedTargets,
                 a.TargetVisible ? "VISIBLE" : "NOT CONFIRMED",
                 a.StickyTarget ? "YES" : "NO");
+            ImGui::Text("LOS cache: hits %d | pending/miss %d | queued %d | task %s | thread %lu",
+                a.VisibilityCacheHits, a.VisibilityCacheMisses,
+                a.VisibilityQueriesQueued,
+                a.VisibilityTaskPending ? "PENDING" : "READY",
+                static_cast<unsigned long>(a.VisibilitySampleThreadId));
             ImGui::Text("Target world: { %.3f, %.3f, %.3f }",
                 a.TargetWorld.X, a.TargetWorld.Y, a.TargetWorld.Z);
             ImGui::Text("Control before: { %.3f, %.3f, %.3f }",
@@ -557,6 +575,16 @@ void Menu::Render()
     ImGui::SetWindowFontScale(1.12f);
     ImGui::Text("%s", PageTitle(g_page));
     ImGui::SetWindowFontScale(1.0f);
+    if (g_page == MenuPage::Diagnostics)
+    {
+        const float buttonWidth = 200.0f;
+        ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - buttonWidth);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.08f, 0.42f, 0.68f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.10f, 0.54f, 0.82f, 1.00f));
+        if (ImGui::Button("WRITE DIAGNOSTIC DUMP", ImVec2(buttonWidth, 26.0f)))
+            WriteDiagnosticDump();
+        ImGui::PopStyleColor(2);
+    }
     ImGui::TextDisabled("%s", PageSubtitle(g_page));
     ImGui::Separator();
     ImGui::Spacing();

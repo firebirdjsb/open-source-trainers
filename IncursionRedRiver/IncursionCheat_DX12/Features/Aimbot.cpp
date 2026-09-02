@@ -4,14 +4,18 @@
 #include "../Menu.h"
 #include "../sdk/GameAccess.h"
 #include "../sdk/Offsets.h"
+#include "../hooks/PresentHook.h"
 #include "../utils/Renderer.h"
 #include "../utils/WorldToScreen.h"
 #include "../imgui/imgui.h"
 
 #include <Windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -19,6 +23,20 @@ namespace
     constexpr double Pi = 3.14159265358979323846;
     Aimbot::Diagnostics g_aimDiagnostics{};
     uintptr_t g_lockedActor = 0;
+    bool g_rmbWasHeld = false;
+
+    struct VisibilitySample
+    {
+        bool Visible = false;
+        ULONGLONG SampledAt = 0;
+    };
+
+    std::unordered_map<uintptr_t, VisibilitySample> g_visibilityCache;
+    std::mutex g_visibilityMutex;
+    std::atomic<bool> g_visibilityTaskPending{ false };
+    std::atomic<uint32_t> g_visibilitySampleThreadId{ 0 };
+    ULONGLONG g_lastVisibilityRequestAt = 0;
+    uintptr_t g_visibilityWorld = 0;
 
     struct AimCandidate
     {
@@ -95,6 +113,95 @@ namespace
         out = location + FVector(0.0, 0.0, halfHeight * heightFactor);
         return out.IsFinite();
     }
+
+    bool QueueVisibilitySamples(const std::vector<AimCandidate>& candidates,
+                                const FVector& viewPoint)
+    {
+        if (candidates.empty() || !viewPoint.IsFinite() || !GetGameWindowThreadId())
+            return false;
+        const uintptr_t world = GameAccess::GetWorld();
+        {
+            std::lock_guard<std::mutex> lock(g_visibilityMutex);
+            if (g_visibilityWorld != world)
+            {
+                g_visibilityCache.clear();
+                g_visibilityWorld = world;
+            }
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        if (g_visibilityTaskPending.load() ||
+            (g_lastVisibilityRequestAt && now - g_lastVisibilityRequestAt < 45))
+            return false;
+
+        std::vector<uintptr_t> actors;
+        actors.reserve(std::min<size_t>(candidates.size(), 8));
+        for (const AimCandidate& candidate : candidates)
+        {
+            if (!candidate.Actor ||
+                std::find(actors.begin(), actors.end(), candidate.Actor) != actors.end())
+                continue;
+            actors.push_back(candidate.Actor);
+            if (actors.size() >= 8)
+                break;
+        }
+        if (actors.empty())
+            return false;
+
+        const int queuedCount = static_cast<int>(actors.size());
+        g_lastVisibilityRequestAt = now;
+        g_visibilityTaskPending.store(true);
+        if (!QueueGameThreadTask([actors = std::move(actors), viewPoint, world]()
+            {
+                std::vector<std::pair<uintptr_t, VisibilitySample>> samples;
+                samples.reserve(actors.size());
+                for (const uintptr_t actor : actors)
+                {
+                    if (!GameAccess::IsIRRCharacter(actor))
+                        continue;
+                    bool visible = false;
+                    if (GameAccess::HasLineOfSight(actor, viewPoint, visible))
+                        samples.push_back({ actor, { visible, GetTickCount64() } });
+                }
+                const ULONGLONG now = GetTickCount64();
+                {
+                    std::lock_guard<std::mutex> lock(g_visibilityMutex);
+                    if (g_visibilityWorld == world)
+                    {
+                        for (const auto& sample : samples)
+                            g_visibilityCache[sample.first] = sample.second;
+                        for (auto it = g_visibilityCache.begin();
+                             it != g_visibilityCache.end();)
+                        {
+                            if (!it->second.SampledAt || now - it->second.SampledAt > 1000)
+                                it = g_visibilityCache.erase(it);
+                            else
+                                ++it;
+                        }
+                    }
+                }
+                g_visibilitySampleThreadId.store(GetCurrentThreadId());
+                g_visibilityTaskPending.store(false);
+            }, false))
+        {
+            g_visibilityTaskPending.store(false);
+            return false;
+        }
+        g_aimDiagnostics.VisibilityQueriesQueued = queuedCount;
+        return true;
+    }
+
+    bool GetCachedVisibility(uintptr_t actor, bool& visible)
+    {
+        visible = false;
+        std::lock_guard<std::mutex> lock(g_visibilityMutex);
+        const auto found = g_visibilityCache.find(actor);
+        if (found == g_visibilityCache.end() || !found->second.SampledAt ||
+            GetTickCount64() - found->second.SampledAt > 250)
+            return false;
+        visible = found->second.Visible;
+        return true;
+    }
 }
 
 namespace Aimbot
@@ -135,6 +242,8 @@ namespace Aimbot
         g_aimDiagnostics = {};
         g_aimDiagnostics.RotationObserved = observed;
         g_aimDiagnostics.RotationChangedAfterAttempt = rotationChanged;
+        g_aimDiagnostics.VisibilityTaskPending = g_visibilityTaskPending.load();
+        g_aimDiagnostics.VisibilitySampleThreadId = g_visibilitySampleThreadId.load();
 
         if (!ImGui::GetCurrentContext())
             return;
@@ -151,11 +260,16 @@ namespace Aimbot
         if (Menu::bOpen)
         {
             g_lockedActor = 0;
+            g_rmbWasHeld = false;
             return;
         }
 
         if (!bEnabled)
+        {
+            g_lockedActor = 0;
+            g_rmbWasHeld = false;
             return;
+        }
 
         const uintptr_t controller = GameAccess::GetLocalController();
         const uintptr_t localPawn = GameAccess::GetLocalPawn();
@@ -165,8 +279,15 @@ namespace Aimbot
         g_aimDiagnostics.Controller = controller;
         g_aimDiagnostics.VisibilityRequired = bVisibilityCheck;
         g_aimDiagnostics.RmbHeld = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        if (g_aimDiagnostics.RmbHeld && !g_rmbWasHeld)
+        {
+            std::lock_guard<std::mutex> lock(g_visibilityMutex);
+            g_visibilityCache.clear();
+            g_lastVisibilityRequestAt = 0;
+        }
         if (!g_aimDiagnostics.RmbHeld)
             g_lockedActor = 0;
+        g_rmbWasHeld = g_aimDiagnostics.RmbHeld;
 
         FVector localPos{};
         if (!GameAccess::GetActorLocation(localPawn, localPos))
@@ -261,6 +382,11 @@ namespace Aimbot
                 }
                 candidates.resize(MaxPoseQueries);
             }
+            std::vector<uintptr_t> poseActors;
+            poseActors.reserve(candidates.size());
+            for (const AimCandidate& candidate : candidates)
+                poseActors.push_back(candidate.Actor);
+            GameAccess::RequestPoseSamples(poseActors, 65);
             for (AimCandidate& candidate : candidates)
             {
                 FVector poseTarget{};
@@ -303,19 +429,22 @@ namespace Aimbot
             }
         }
 
+        if (bVisibilityCheck && g_aimDiagnostics.RmbHeld)
+            QueueVisibilitySamples(candidates, camera.Location);
+
         auto visible = [&](const AimCandidate& candidate) -> bool
         {
             if (!bVisibilityCheck || !g_aimDiagnostics.RmbHeld)
                 return true;
-            // The pose shortlist is capped at eight. Check the whole shortlist so
-            // six nearer occluded actors cannot suppress an open seventh/eighth
-            // target and make the yellow acquisition marker disappear.
-            if (g_aimDiagnostics.LineOfSightChecks >= 8)
-                return false;
             bool lineOfSight = false;
+            if (!GetCachedVisibility(candidate.Actor, lineOfSight))
+            {
+                ++g_aimDiagnostics.VisibilityCacheMisses;
+                return false;
+            }
+            ++g_aimDiagnostics.VisibilityCacheHits;
             ++g_aimDiagnostics.LineOfSightChecks;
-            if (!GameAccess::HasLineOfSight(candidate.Actor, camera.Location, lineOfSight) ||
-                !lineOfSight)
+            if (!lineOfSight)
             {
                 ++g_aimDiagnostics.OccludedTargets;
                 return false;
@@ -417,8 +546,7 @@ namespace Aimbot
         g_aimDiagnostics.UsedPoseAwareBodyPart = chosen.PoseAware;
         g_aimDiagnostics.TargetBodyComponent = chosen.BodyComponent;
         g_aimDiagnostics.TargetVisible = !bVisibilityCheck ||
-            !g_aimDiagnostics.RmbHeld || g_aimDiagnostics.OccludedTargets <
-            g_aimDiagnostics.LineOfSightChecks;
+            !g_aimDiagnostics.RmbHeld || best != nullptr;
 
         // Gold marker confirms that a target was acquired and shows the exact aim point.
         Renderer::DrawCircle(chosen.Screen.x, chosen.Screen.y, 7.0f,
@@ -432,13 +560,14 @@ namespace Aimbot
                         g_aimDiagnostics.RotationBefore);
         g_aimDiagnostics.AimAttempted = true;
 
-        if (bUseMouseInput && bSmoothAim)
+        if (bUseMouseInput)
         {
             // The old direct ControlRotation write was immediately overwritten by the game's
             // Enhanced Input/camera update. Feed the game real relative mouse-look input instead.
             g_aimDiagnostics.UsedMouseInput = true;
             g_aimDiagnostics.DirectWriteSucceeded = ApplyMouseAim(
-                chosen.Screen, center, smoothAmount, aimStrength);
+                chosen.Screen, center, bSmoothAim ? smoothAmount : 1.0f,
+                aimStrength);
             return;
         }
 

@@ -324,6 +324,22 @@ namespace ESP
         std::sort(candidates.begin(), candidates.end(),
             [](const Candidate& a, const Candidate& b)
             { return a.DistanceMeters < b.DistanceMeters; });
+
+        if (bDrawSkeleton)
+        {
+            std::vector<uintptr_t> poseActors;
+            poseActors.reserve(std::min<size_t>(candidates.size(), 16));
+            for (const Candidate& candidate : candidates)
+            {
+                if (candidate.DistanceMeters > skeletonDistanceMeters)
+                    break;
+                poseActors.push_back(candidate.Actor);
+                if (poseActors.size() >= 16)
+                    break;
+            }
+            GameAccess::RequestPoseSamples(poseActors, 75);
+        }
+
         for (const Candidate& candidate : candidates)
         {
             if (g_lastRenderedCount >= std::max(maxActors, 1))
@@ -360,7 +376,12 @@ namespace ESP
 
             ++g_lastRenderedCount;
             if (bDrawSkeleton && candidate.DistanceMeters <= skeletonDistanceMeters)
-                DrawBoneSkeleton(GameAccess::GetBonePoints(candidate.Actor), camera, width, height);
+            {
+                auto bones = GameAccess::GetBonePoints(candidate.Actor);
+                if (bones.empty())
+                    bones = GameAccess::GetCachedPoseSkeleton(candidate.Actor);
+                DrawBoneSkeleton(bones, camera, width, height);
+            }
 
             const ImU32 color = candidate.Hostile ? IM_COL32(255, 90, 90, 230) :
                                                    IM_COL32(255, 190, 70, 220);
@@ -428,13 +449,18 @@ namespace ESP
             ImGui::SliderFloat("Skeleton Distance", &skeletonDistanceMeters,
                                10.0f, 250.0f, "%.0f m");
             const auto& d = GameAccess::GetDiagnostics();
+            const auto pose = GameAccess::GetPoseCacheDiagnostics();
             ImGui::Text("Bone cache: %d actors / %d points (independent)",
                 d.ValidatedBoneActorCount, d.ValidatedBonePointCount);
+            ImGui::Text("Live pose fallback: %d cached | last %d/%d | %s | thread %lu",
+                pose.CachedActors, pose.LastSampledActors, pose.LastRequestedActors,
+                pose.TaskPending ? "SAMPLING" : "READY",
+                static_cast<unsigned long>(pose.LastSampleThreadId));
             ImGui::Text("Projected this frame: %d actors / %d visible points",
                 g_lastSkeletonActors, g_lastSkeletonPoints);
         }
         ImGui::TextWrapped("ESP is projected from LastFrameCameraCachePrivate, matching the backbuffer being presented instead of a newer game-thread camera. A small adaptive filter removes sub-frame jitter but responds immediately to real turns and target movement. No per-actor ProcessEvent projection calls are made.");
-        ImGui::TextWrapped("Bone ESP reads and validates CachedComponentSpaceTransforms, then uses native reference-skeleton parent indices when the runtime layout can be proven.");
+        ImGui::TextWrapped("Bone ESP prefers validated CachedComponentSpaceTransforms. Living SkeletalMeshComponentBudgeted AI that leave that base array empty use cached, game-thread IRRBodyComponent head/thorax/limb locations, so the stick figure remains available before ragdoll/death.");
         ImGui::TextWrapped("Actor discovery is based on actual IRRBaseCharacter class identity and remains independent of local-pawn acquisition; health is a secondary living/dead filter.");
         ImGui::TextWrapped("Red actors are confirmed by the local IRRTeamComponent Hostiles array. Amber candidates are shown only while that team list is unavailable, so acquisition and bone debugging can continue without mislabeling them as enemies.");
     }

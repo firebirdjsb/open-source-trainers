@@ -43,6 +43,11 @@ namespace Aimbot
         int InFovTargets = 0;
         int LineOfSightChecks = 0;
         int OccludedTargets = 0;
+        int VisibilityCacheHits = 0;
+        int VisibilityCacheMisses = 0;
+        int VisibilityQueriesQueued = 0;
+        uint32_t VisibilitySampleThreadId = 0;
+        bool VisibilityTaskPending = false;
     };
 
     extern bool bEnabled;
