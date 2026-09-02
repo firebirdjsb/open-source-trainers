@@ -57,8 +57,8 @@ void CheatManager::Tick()
         GameAccess::Refresh();
         m_lastRuntimeRefreshMs = now;
     }
-    ESP::Run();
     Aimbot::Run();
+    ESP::Run();
     UECheats::ProcessTick();
     ItemMagnet::ProcessTick();
     MovementTools::ProcessTick();

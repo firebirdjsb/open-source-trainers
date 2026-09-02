@@ -34,6 +34,7 @@ namespace
     bool g_timeBackupValid = false;
     uintptr_t g_fallHealth = 0;
     float g_originalFallHeight = 0.0f;
+    float g_lastFallHeightWritten = 0.0f;
     bool g_fallBackupValid = false;
 
     bool g_timeDilation = false;
@@ -173,16 +174,32 @@ namespace
     void RestoreNoFall()
     {
         if (g_fallBackupValid && g_fallHealth)
-            Memory::Write(g_fallHealth + Offsets::HealthComponent_FallHeightStart, g_originalFallHeight);
+        {
+            // FallHeightStart is transient state, not a tuning constant. Restoring a
+            // stale pre-toggle altitude after the player moved can itself create a
+            // damaging drop, so leave the tracker at the current character height.
+            FVector current{};
+            const float safeHeight = GameAccess::GetActorLocation(
+                GameAccess::GetLocalPawn(), current) && current.IsFinite() ?
+                static_cast<float>(current.Z) : g_originalFallHeight;
+            Memory::Write(g_fallHealth + Offsets::HealthComponent_FallHeightStart,
+                          safeHeight);
+        }
         g_fallHealth = 0;
         g_originalFallHeight = 0.0f;
+        g_lastFallHeightWritten = 0.0f;
         g_fallBackupValid = false;
     }
 
     void ApplyNoFall()
     {
-        const auto health = GameAccess::GetHealth(GameAccess::GetLocalPawn());
+        const uintptr_t pawn = GameAccess::GetLocalPawn();
+        const auto health = GameAccess::GetHealth(pawn);
         if (!health.Component)
+            return;
+        FVector current{};
+        if (!GameAccess::GetActorLocation(pawn, current) || !current.IsFinite() ||
+            current.Z < -10000000.0 || current.Z > 10000000.0)
             return;
         if (!g_fallBackupValid || g_fallHealth != health.Component)
         {
@@ -195,9 +212,12 @@ namespace
             g_originalFallHeight = original;
             g_fallBackupValid = true;
         }
-        constexpr float effectivelyDisabled = 1000000000.0f;
+        // The game records the Z coordinate where falling begins and subtracts the
+        // landing Z. The old +1e9 write amplified the fall instead of suppressing
+        // it. Following the live character Z keeps the measured drop near zero.
+        g_lastFallHeightWritten = static_cast<float>(current.Z);
         Memory::Write(health.Component + Offsets::HealthComponent_FallHeightStart,
-                      effectivelyDisabled);
+                      g_lastFallHeightWritten);
     }
 
     void ApplyMovementTuning()
@@ -419,6 +439,9 @@ namespace MovementTools
         if (health.Valid)
             ImGui::Text("Health: %.1f / %.1f", health.Current, health.Maximum);
         ImGui::Checkbox("No fall damage", &g_noFallDamage);
+        if (g_noFallDamage)
+            ImGui::TextDisabled("Fall tracker follows current Z: %.1f cm",
+                                g_lastFallHeightWritten);
 
         ImGui::Separator();
         ImGui::Text("Personal time / movement tuning:");

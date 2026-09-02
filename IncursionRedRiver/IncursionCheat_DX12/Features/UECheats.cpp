@@ -1,12 +1,14 @@
 #include "UECheats.h"
 
 #include "../Memory/Memory.h"
+#include "../hooks/PresentHook.h"
 #include "../sdk/GameAccess.h"
 #include "../sdk/Offsets.h"
 #include "../imgui/imgui.h"
 
 #include <Windows.h>
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -110,6 +112,12 @@ namespace
 
     FloatBackup g_weightBackup{};
     WeaponConditionBackup g_weaponConditionBackup{};
+    std::atomic<bool> g_durabilityTaskPending{ false };
+    std::atomic<float> g_lastDurabilityBefore{ -1.0f };
+    std::atomic<float> g_lastDurabilityAfter{ -1.0f };
+    std::atomic<int> g_durabilityRepairState{ 0 }; // 0 idle, 1 full, 2 repaired, 3 failed
+    uintptr_t g_durabilityComponent = 0;
+    ULONGLONG g_lastDurabilityRequest = 0;
     uintptr_t g_invisibleAppliedInstance = 0;
     uintptr_t g_bulletTraceAppliedInstance = 0;
     uintptr_t g_invulnerableAppliedInstance = 0;
@@ -659,6 +667,50 @@ namespace
         const float zero = 0.0f;
         for (const uintptr_t offset : WeaponConditionOffsets)
             Memory::Write(component + offset, zero);
+
+        // Existing poor-condition weapons need an explicit repair in addition to
+        // zero degradation/misfire rates. Both durability functions are dispatched
+        // on the game thread; calling ProcessEvent from Present was crash-prone.
+        const uintptr_t gameInstance = GameAccess::GetGameInstance();
+        const ULONGLONG now = GetTickCount64();
+        if (!gameInstance || g_durabilityTaskPending.load())
+            return;
+        if (g_durabilityComponent == component && g_lastDurabilityRequest &&
+            now - g_lastDurabilityRequest < 750)
+            return;
+        g_durabilityComponent = component;
+        g_lastDurabilityRequest = now;
+        g_durabilityTaskPending.store(true);
+        if (!QueueGameThreadTask([component, gameInstance]()
+            {
+                float before = -1.0f;
+                const bool queried = GameAccess::QueryFloatFunction(component,
+                    FunctionIndices::WeaponComponent_GetDurabilityPercentage,
+                    before);
+                g_lastDurabilityBefore.store(before);
+                bool dispatched = queried;
+                if (queried && before < 99.9f)
+                {
+                    float fullDurability = 100.0f;
+                    dispatched = GameAccess::InvokeFunctionRaw(gameInstance,
+                        FunctionIndices::GeneralGameInstance_SetDurability,
+                        &fullDurability, sizeof(fullDurability));
+                }
+
+                float after = before;
+                if (dispatched)
+                    GameAccess::QueryFloatFunction(component,
+                        FunctionIndices::WeaponComponent_GetDurabilityPercentage,
+                        after);
+                g_lastDurabilityAfter.store(after);
+                g_durabilityRepairState.store(!queried || !dispatched ? 3 :
+                    (before < 99.9f ? 2 : 1));
+                g_durabilityTaskPending.store(false);
+            }, false))
+        {
+            g_durabilityRepairState.store(3);
+            g_durabilityTaskPending.store(false);
+        }
     }
 
     void RestoreCarryWeight()
@@ -873,6 +925,11 @@ namespace UECheats
         bNoWeaponSway = false;
         bNoMalfunctions = false;
         RestoreWeaponCondition();
+        g_durabilityComponent = 0;
+        g_lastDurabilityRequest = 0;
+        g_lastDurabilityBefore.store(-1.0f);
+        g_lastDurabilityAfter.store(-1.0f);
+        g_durabilityRepairState.store(0);
         bHighCarryWeight = false;
         RestoreCarryWeight();
         bInvisible = false;
@@ -957,15 +1014,25 @@ namespace UECheats
         ImGui::Text("Weapon:");
         if (ImGui::Checkbox("Infinite Ammo", &bInfiniteAmmo))
             bInfiniteAmmo ? EnableInfiniteAmmo() : DisableInfiniteAmmo();
-        if (ImGui::Checkbox("No Reload (game infinite-ammo path)", &bNoReload))
+        if (ImGui::Checkbox("No Reload", &bNoReload))
             bNoReload ? EnableNoReload() : DisableNoReload();
-        ImGui::Checkbox("No Recoil (runtime recoil state, test)", &bNoRecoil);
-        ImGui::Checkbox("No Weapon Sway (runtime arm sway, test)", &bNoWeaponSway);
-        if (ImGui::Checkbox("No Malfunctions / Durability Loss (test)",
+        ImGui::Checkbox("No Recoil", &bNoRecoil);
+        ImGui::Checkbox("No Weapon Sway", &bNoWeaponSway);
+        if (ImGui::Checkbox("No Malfunctions / Durability Loss",
                             &bNoMalfunctions))
         {
             if (bNoMalfunctions) ApplyNoMalfunctions();
             else RestoreWeaponCondition();
+        }
+        if (bNoMalfunctions)
+        {
+            const int repairState = g_durabilityRepairState.load();
+            ImGui::TextDisabled("Held durability: %.1f -> %.1f | %s",
+                g_lastDurabilityBefore.load(), g_lastDurabilityAfter.load(),
+                g_durabilityTaskPending.load() ? "CHECKING" :
+                (repairState == 2 ? "REPAIRED TO 100" :
+                 (repairState == 1 ? "FULL" :
+                  (repairState == 3 ? "REPAIR FAILED" : "WAIT"))));
         }
 
         const uintptr_t gameInstance = GameAccess::GetGameInstance();

@@ -216,6 +216,20 @@ namespace DiagnosticsService
             << " liveBodyPoints=" << a.LiveBodyTargets
             << " poseAware=" << a.PoseAwareTargets
             << " poseFailures=" << a.PoseAwareFailures << "\n";
+        const auto visibility = GameAccess::GetVisibilityDiagnostics();
+        out << "Exposure candidates: known=" << a.VisibilityKnownTargets
+            << " visible=" << a.VisibilityVisibleTargets
+            << " hidden=" << a.VisibilityHiddenTargets
+            << " pending=" << a.VisibilityUnknownTargets
+            << " exposedPoint=" << YesNo(a.UsedExposedPoint) << "\n";
+        out << "Exposure cache: actors=" << visibility.CachedActors
+            << " visible=" << visibility.VisibleActors
+            << " queued=" << visibility.QueuedActors
+            << " taskPending=" << YesNo(visibility.TaskPending)
+            << " lastBatch=" << visibility.LastRequestedActors
+            << " lastVisible=" << visibility.LastVisibleActors
+            << " thread=0x" << std::hex << visibility.LastSampleThreadId
+            << std::dec << "\n";
         out << "Target world={" << a.TargetWorld.X << ',' << a.TargetWorld.Y << ','
             << a.TargetWorld.Z << "} velocity={" << a.TargetVelocity.X << ','
             << a.TargetVelocity.Y << ',' << a.TargetVelocity.Z << "}\n";

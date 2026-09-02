@@ -155,6 +155,7 @@ namespace
         if (ImGui::CollapsingHeader("Aimbot verification", ImGuiTreeNodeFlags_DefaultOpen))
         {
             const auto& a = Aimbot::GetDiagnostics();
+            const auto visibility = GameAccess::GetVisibilityDiagnostics();
             Address("aim controller", a.Controller);
             Address("target character", a.TargetActor);
             Address("target BodyComponent", a.TargetBodyComponent);
@@ -178,6 +179,15 @@ namespace
             ImGui::Text("Target lock: %s | sticky: %s",
                 a.TargetFound ? "ACQUIRED" : "WAIT",
                 a.StickyTarget ? "YES" : "NO");
+            ImGui::Text("Exposure candidates: known %d | visible %d | hidden %d | pending %d",
+                a.VisibilityKnownTargets, a.VisibilityVisibleTargets,
+                a.VisibilityHiddenTargets, a.VisibilityUnknownTargets);
+            ImGui::Text("Exposure cache: %d actors / %d visible | queued %d | task %s",
+                visibility.CachedActors, visibility.VisibleActors,
+                visibility.QueuedActors, visibility.TaskPending ? "PENDING" : "IDLE");
+            ImGui::Text("Exposure game thread: 0x%X | last batch %d / visible %d",
+                visibility.LastSampleThreadId, visibility.LastRequestedActors,
+                visibility.LastVisibleActors);
             ImGui::Text("Target world: { %.3f, %.3f, %.3f }",
                 a.TargetWorld.X, a.TargetWorld.Y, a.TargetWorld.Z);
             ImGui::Text("Control before: { %.3f, %.3f, %.3f }",
@@ -331,7 +341,7 @@ namespace
     {
         switch (page)
         {
-        case MenuPage::ESP: return "Enemy visualization and skeletal overlays";
+        case MenuPage::ESP: return "Enemy visualization and shared exposure state";
         case MenuPage::Aimbot: return "Crosshair target acquisition and ballistic prediction";
         case MenuPage::Tactical: return "Radar, proximity awareness and off-screen threat indicators";
         case MenuPage::Player: return "Core player, weapon and survivability controls";

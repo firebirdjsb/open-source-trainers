@@ -106,13 +106,13 @@ namespace Aimbot
     bool bUseMouseInput = true;
     bool bAimOnFire = true;
     bool bPrediction = true;
-    float smoothAmount = 6.0f;
+    float smoothAmount = 4.5f;
     float aimStrength = 1.0f;
-    float fovRadius = 180.0f;
+    float fovRadius = 25.0f;
     float maxDistanceMeters = 150.0f;
-    float predictionMultiplier = 1.0f;
+    float predictionMultiplier = 0.25f;
     float maxPredictionTime = 2.0f;
-    std::string selectedBone = "head";
+    std::string selectedBone = "neck";
 
     static const std::vector<std::string> bones = {
         "head", "neck", "chest", "stomach", "arm_l", "arm_r",
@@ -306,17 +306,64 @@ namespace Aimbot
                 candidate.BodyComponent = bodyComponent;
                 ++g_aimDiagnostics.PoseAwareTargets;
             }
-            candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-                [&](const AimCandidate& candidate)
-                { return candidate.ScreenDistance > fovRadius; }), candidates.end());
-            std::sort(candidates.begin(), candidates.end(),
-                [](const AimCandidate& left, const AimCandidate& right)
-                { return left.ScreenDistance < right.ScreenDistance; });
-            if (candidates.empty())
+        }
+
+        // Visibility is one shared, game-thread sampled result. The selected point
+        // is tested first, followed by every major body anchor. Fully occluded actors
+        // are rejected, while a visible limb can supply the actual safe aim point.
+        std::vector<uintptr_t> visibilityActors;
+        visibilityActors.reserve(candidates.size());
+        for (const AimCandidate& candidate : candidates)
+            visibilityActors.push_back(candidate.Actor);
+        GameAccess::RequestVisibilitySamples(visibilityActors, selectedBone,
+            g_aimDiagnostics.ActivationHeld ? 65u : 140u);
+
+        for (AimCandidate& candidate : candidates)
+        {
+            bool visible = false;
+            FVector exposed{};
+            const bool known = GameAccess::GetCachedVisibility(candidate.Actor,
+                visible, &exposed, g_aimDiagnostics.ActivationHeld ? 550u : 900u);
+            if (!known)
             {
-                g_lockedActor = 0;
-                return;
+                ++g_aimDiagnostics.VisibilityUnknownTargets;
+                candidate.ScreenDistance = std::numeric_limits<float>::infinity();
+                continue;
             }
+            ++g_aimDiagnostics.VisibilityKnownTargets;
+            if (!visible)
+            {
+                ++g_aimDiagnostics.VisibilityHiddenTargets;
+                candidate.ScreenDistance = std::numeric_limits<float>::infinity();
+                continue;
+            }
+            ++g_aimDiagnostics.VisibilityVisibleTargets;
+
+            Vector2 exposedScreen{};
+            if (!exposed.IsFinite() || !WorldToScreen::Convert(exposed,
+                    exposedScreen, camera.Location, camera.Rotation, camera.FOV,
+                    static_cast<int>(display.x), static_cast<int>(display.y)))
+            {
+                candidate.ScreenDistance = std::numeric_limits<float>::infinity();
+                continue;
+            }
+            const float dx = exposedScreen.x - center.x;
+            const float dy = exposedScreen.y - center.y;
+            candidate.Target = exposed;
+            candidate.Screen = exposedScreen;
+            candidate.ScreenDistance = std::sqrt(dx * dx + dy * dy);
+        }
+        candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+            [&](const AimCandidate& candidate)
+            { return !std::isfinite(candidate.ScreenDistance) ||
+                     candidate.ScreenDistance > fovRadius; }), candidates.end());
+        std::sort(candidates.begin(), candidates.end(),
+            [](const AimCandidate& left, const AimCandidate& right)
+            { return left.ScreenDistance < right.ScreenDistance; });
+        if (candidates.empty())
+        {
+            g_lockedActor = 0;
+            return;
         }
 
         const AimCandidate* best = nullptr;
@@ -409,6 +456,7 @@ namespace Aimbot
         g_aimDiagnostics.UsedCapsuleFallback = chosen.CapsuleFallback;
         g_aimDiagnostics.UsedPoseAwareBodyPart = chosen.PoseAware;
         g_aimDiagnostics.TargetBodyComponent = chosen.BodyComponent;
+        g_aimDiagnostics.UsedExposedPoint = true;
 
         // Gold marker confirms that a target was acquired and shows the exact aim point.
         Renderer::DrawCircle(chosen.Screen.x, chosen.Screen.y, 7.0f,
@@ -422,7 +470,7 @@ namespace Aimbot
                         g_aimDiagnostics.RotationBefore);
         g_aimDiagnostics.AimAttempted = true;
 
-        if (bUseMouseInput)
+        if (bUseMouseInput && bSmoothAim)
         {
             // The old direct ControlRotation write was immediately overwritten by the game's
             // Enhanced Input/camera update. Feed the game real relative mouse-look input instead.
@@ -482,7 +530,7 @@ namespace Aimbot
             if (ImGui::RadioButton(bone.c_str(), selectedBone == bone))
                 selectedBone = bone;
         }
-        ImGui::TextWrapped("Hold RMB to aim, or fire with LMB when Aim while firing is enabled. Both inputs use the selected live-pose body point and the same FOV limit. Targets are selected strictly by crosshair distance with no additional acquisition gate.");
+        ImGui::TextWrapped("Hold RMB to aim, or fire with LMB when Aim while firing is enabled. Both inputs use the same FOV and exposure rules. The selected bone is preferred; if it is covered but another body anchor is exposed, that exposed anchor becomes the safe aim point.");
         ImGui::TextWrapped("With smoothing enabled, Mouse Input Aim follows normal game input. With smoothing disabled, the exact dump-validated SetControlRotation path is used automatically so a sensitivity-dependent mouse delta cannot overshoot the target.");
         ImGui::TextWrapped("Targets must be present in the validated local IRRTeamComponent Hostiles array; unknown/neutral IRR candidates are never selected.");
         ImGui::Text("Scan %d | hostile %d | living %d | range %d | projected %d | FOV %d",
@@ -499,6 +547,11 @@ namespace Aimbot
         ImGui::Text("Target lock: %s | sticky %s",
             g_aimDiagnostics.TargetFound ? "ACQUIRED" : "WAIT",
             g_aimDiagnostics.StickyTarget ? "YES" : "NO");
+        ImGui::Text("Exposure: known %d | visible %d | hidden %d | pending %d",
+            g_aimDiagnostics.VisibilityKnownTargets,
+            g_aimDiagnostics.VisibilityVisibleTargets,
+            g_aimDiagnostics.VisibilityHiddenTargets,
+            g_aimDiagnostics.VisibilityUnknownTargets);
         ImGui::Text("Prediction %s | solver %s | flight %.3f s | projectile %.1f m/s",
             g_aimDiagnostics.PredictionApplied ? "ON" : "WAIT",
             g_aimDiagnostics.UsedGameBallisticSolver ? "EasyBallistics" : "analytic fallback",

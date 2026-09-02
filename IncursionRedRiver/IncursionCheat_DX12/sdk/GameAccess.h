@@ -54,6 +54,18 @@ namespace GameAccess
         bool TaskPending = false;
     };
 
+    struct VisibilityDiagnostics
+    {
+        int32_t CachedActors = 0;
+        int32_t VisibleActors = 0;
+        int32_t QueuedActors = 0;
+        int32_t LastRequestedActors = 0;
+        int32_t LastVisibleActors = 0;
+        uint64_t LastCompletedAt = 0;
+        uint32_t LastSampleThreadId = 0;
+        bool TaskPending = false;
+    };
+
     struct RuntimeDiagnostics
     {
         uint64_t Serial = 0;
@@ -153,6 +165,7 @@ namespace GameAccess
 
     const RuntimeDiagnostics& GetDiagnostics();
     PoseCacheDiagnostics GetPoseCacheDiagnostics();
+    VisibilityDiagnostics GetVisibilityDiagnostics();
     const char* SourceName(Source source);
 
     uintptr_t GetWorld();
@@ -198,6 +211,16 @@ namespace GameAccess
     // thread, then serve immutable cached points to aimbot target acquisition.
     bool RequestPoseSamples(const std::vector<uintptr_t>& actors,
                             uint32_t minimumIntervalMs = 75);
+    // Schedules dump-verified CheckSphereVisibility work on the game/window thread.
+    // A broad character-volume test cheaply rejects fully occluded actors, then
+    // exact pose anchors are tested in preferred-first order so a visible limb can
+    // be selected even when the requested neck/head point is behind cover.
+    bool RequestVisibilitySamples(const std::vector<uintptr_t>& actors,
+                                  const std::string& preferredTarget,
+                                  uint32_t minimumIntervalMs = 100);
+    bool GetCachedVisibility(uintptr_t actor, bool& outVisible,
+                             FVector* outExposedPoint = nullptr,
+                             uint32_t maximumAgeMs = 750);
     bool GetActorVelocity(uintptr_t actor, FVector& outVelocity);
     bool PredictBallisticAim(const FVector& start, const FVector& target,
                              const FVector& targetVelocity, float maxTime,

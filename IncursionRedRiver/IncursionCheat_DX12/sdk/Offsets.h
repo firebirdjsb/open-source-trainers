@@ -88,6 +88,9 @@ namespace Offsets
     constexpr uintptr_t InventoryComponent_FWeightMultiplier = 0x3C0;
     constexpr uintptr_t InventoryComponent_MaxWeight          = 0x3C8;
     constexpr uintptr_t InventoryComponent_MainContainers     = 0x3F8;
+    constexpr uintptr_t InventoryComponent_PickUpContainerItem = 0x418;
+    constexpr uintptr_t PickUpActor_InventoryComponent         = 0x2C0;
+    constexpr uintptr_t InventorySpatialContainerSettings_ContainerSize = 0x38;
 
     constexpr uintptr_t IRRBaseCharacter_BodyComponent   = 0x660;
     constexpr uintptr_t IRRBaseCharacter_TeamComponent   = 0x670;
@@ -202,6 +205,9 @@ namespace ObjectIndices
     constexpr int32_t WeaponComponentClass       = 0x115F;
     constexpr int32_t BPMasterWeaponClass        = 0x11D44;
     constexpr int32_t PickUpActorClass           = 0x111D;
+    constexpr int32_t BPAVSDeltaBackpackClass    = 0x1102E;
+    constexpr int32_t BackpackStorageSettings0   = 0x1103F;
+    constexpr int32_t BackpackStorageSettings1   = 0x11040;
 
     // Loaded package objects used only as authoritative FName sources for the
     // GeneralGameInstance debug inventory functions. Their names are never guessed.
@@ -210,6 +216,8 @@ namespace ObjectIndices
     constexpr int32_t Package_ID_MarkedCoin      = 0x0C854;
     constexpr int32_t Package_ID_HealthInjector  = 0x0C85C;
     constexpr int32_t DefaultInventoryFunctionLibrary = 0x0907C;
+    constexpr int32_t DefaultGameplayStatics     = 0x0874F;
+    constexpr int32_t DefaultGeneralFunctionLibrary = 0x08F1B;
 }
 
 // Stable UFunction indices from the same updated Dumper-7 object dump. Every call
@@ -229,7 +237,10 @@ namespace FunctionIndices
     constexpr int32_t Controller_StopMovement = 0x29C8;
     constexpr int32_t EBBarrel_CalculateAimDirectionFromLocation = 0x2B75;
     constexpr int32_t PlayerController_ProjectWorldLocationToScreen = 0x2A36;
+    constexpr int32_t WeaponComponent_GetDurabilityPercentage = 0x2B6F;
     constexpr int32_t CharacterMovementComponent_SetMovementMode = 0x527E;
+    constexpr int32_t GameplayStatics_BeginDeferredActorSpawnFromClass = 0x54F0;
+    constexpr int32_t GameplayStatics_FinishSpawningActor = 0x5507;
     constexpr int32_t SenseStimulusComponent_SetInvisibleServer = 0x5FC4;
     constexpr int32_t Actor_K2_SetActorLocation = 0x296F;
     constexpr int32_t GeneralGameInstance_CompleteTrackedMissions = 0x6B70;
@@ -289,4 +300,5 @@ namespace FunctionIndices
     constexpr int32_t IRRBodyComponent_GetBodyPartLocation = 0x6DBF;
     constexpr int32_t IRRBodyComponent_GetEyeLocation = 0x6DC0;
     constexpr int32_t IRRBodyComponent_GetMainBoneLocations = 0x6DC1;
+    constexpr int32_t GeneralFunctionLibrary_CheckSphereVisibility = 0x6F56;
 }

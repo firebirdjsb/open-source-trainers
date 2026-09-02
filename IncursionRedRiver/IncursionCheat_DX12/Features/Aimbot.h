@@ -28,6 +28,7 @@ namespace Aimbot
         bool UsedPoseAwareBodyPart = false;
         bool PredictionApplied = false;
         bool UsedGameBallisticSolver = false;
+        bool UsedExposedPoint = false;
         float PredictedFlightTime = 0.0f;
         float ProjectileSpeed = 0.0f;
         uintptr_t TargetBodyComponent = 0;
@@ -41,6 +42,10 @@ namespace Aimbot
         int PoseAwareFailures = 0;
         int ProjectedTargets = 0;
         int InFovTargets = 0;
+        int VisibilityKnownTargets = 0;
+        int VisibilityVisibleTargets = 0;
+        int VisibilityHiddenTargets = 0;
+        int VisibilityUnknownTargets = 0;
     };
 
     extern bool bEnabled;

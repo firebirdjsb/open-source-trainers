@@ -20,6 +20,8 @@ namespace
 {
     int g_lastCandidateCount = 0;
     int g_lastRenderedCount = 0;
+    int g_lastVisibleCount = 0;
+    int g_lastHiddenCount = 0;
     uintptr_t g_nameCacheWorld = 0;
     std::unordered_map<uintptr_t, std::string> g_nameCache;
 
@@ -110,6 +112,8 @@ namespace ESP
     {
         g_lastCandidateCount = 0;
         g_lastRenderedCount = 0;
+        g_lastVisibleCount = 0;
+        g_lastHiddenCount = 0;
 
         if (!bEnabled || !ImGui::GetCurrentContext())
             return;
@@ -169,6 +173,15 @@ namespace ESP
             [](const Candidate& a, const Candidate& b)
             { return a.DistanceMeters < b.DistanceMeters; });
 
+        std::vector<uintptr_t> visibilityActors;
+        const size_t sampleCount = std::min<size_t>(candidates.size(),
+            static_cast<size_t>(std::max(maxActors, 1)));
+        visibilityActors.reserve(sampleCount);
+        for (size_t index = 0; index < sampleCount; ++index)
+            if (candidates[index].Hostile)
+                visibilityActors.push_back(candidates[index].Actor);
+        GameAccess::RequestVisibilitySamples(visibilityActors, "chest", 120);
+
         for (const Candidate& candidate : candidates)
         {
             if (g_lastRenderedCount >= std::max(maxActors, 1))
@@ -204,8 +217,20 @@ namespace ESP
                 continue;
 
             ++g_lastRenderedCount;
-            const ImU32 color = candidate.Hostile ? IM_COL32(255, 90, 90, 230) :
-                                                   IM_COL32(255, 190, 70, 220);
+            bool visible = false;
+            const bool visibilityKnown = candidate.Hostile &&
+                GameAccess::GetCachedVisibility(candidate.Actor, visible,
+                                                nullptr, 800);
+            if (candidate.Hostile)
+            {
+                if (visibilityKnown && visible)
+                    ++g_lastVisibleCount;
+                else
+                    ++g_lastHiddenCount;
+            }
+            const ImU32 color = !candidate.Hostile ? IM_COL32(255, 190, 70, 220) :
+                (visibilityKnown && visible ? IM_COL32(70, 235, 120, 235) :
+                                              IM_COL32(255, 70, 70, 235));
             if (bDrawBoxes)
                 Renderer::DrawBox(left, topY, boxWidth, boxHeight, color, 1.5f);
 
@@ -264,8 +289,10 @@ namespace ESP
         ImGui::SliderInt("Max On-screen Actors", &maxActors, 5, 100);
         ImGui::Text("On-screen candidates: %d | rendered: %d",
             g_lastCandidateCount, g_lastRenderedCount);
+        ImGui::Text("Exposure: %d visible (green) | %d hidden/pending (red)",
+            g_lastVisibleCount, g_lastHiddenCount);
         ImGui::TextWrapped("ESP is projected from LastFrameCameraCachePrivate, matching the backbuffer being presented instead of a newer game-thread camera. A small adaptive filter removes sub-frame jitter but responds immediately to real turns and target movement. No per-actor ProcessEvent projection calls are made.");
         ImGui::TextWrapped("Actor discovery is based on actual IRRBaseCharacter class identity and remains independent of local-pawn acquisition; health is a secondary living/dead filter.");
-        ImGui::TextWrapped("Red actors are confirmed by the local IRRTeamComponent Hostiles array. Amber candidates are shown only while that team list is unavailable, so actor acquisition can continue without mislabeling them as enemies.");
+        ImGui::TextWrapped("Confirmed hostiles share the aimbot's budgeted multi-point exposure cache: green means at least one live body anchor is visible, while red means fully occluded or awaiting a fresh sample. Amber candidates are shown only while the team list is unavailable.");
     }
 }

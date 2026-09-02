@@ -90,6 +90,24 @@ namespace
         bool UsedIndividualFallback = false;
     };
 
+    struct VisibilityCacheEntry
+    {
+        FVector ExposedPoint{};
+        FVector ActorLocation{};
+        ULONGLONG SampledAt = 0;
+        bool Visible = false;
+    };
+
+    struct VisibilityWork
+    {
+        uintptr_t Actor = 0;
+        FVector ActorLocation{};
+        FVector ObserverLocation{};
+        std::array<FVector, 10> Points{};
+        uint8_t PointCount = 0;
+        float BroadRadius = 75.0f;
+    };
+
     GameAccess::RuntimeDiagnostics g_diag{};
     ObjectArrayLayout g_objects{};
     ClassPointers g_classes{};
@@ -123,6 +141,16 @@ namespace
     std::atomic<ULONGLONG> g_poseLastCompletedAt{ 0 };
     ULONGLONG g_lastPoseRequestAt = 0;
     uintptr_t g_poseCacheWorld = 0;
+    std::unordered_map<uintptr_t, VisibilityCacheEntry> g_visibilityCache;
+    std::vector<VisibilityWork> g_visibilityQueue;
+    std::mutex g_visibilityCacheMutex;
+    std::atomic<bool> g_visibilityTaskPending{ false };
+    std::atomic<uint32_t> g_visibilityLastSampleThreadId{ 0 };
+    std::atomic<int32_t> g_visibilityLastRequestedActors{ 0 };
+    std::atomic<int32_t> g_visibilityLastVisibleActors{ 0 };
+    std::atomic<ULONGLONG> g_visibilityLastCompletedAt{ 0 };
+    ULONGLONG g_lastVisibilityRequestAt = 0;
+    uintptr_t g_visibilityCacheWorld = 0;
     std::unordered_map<ClassPair, bool, ClassPairHash> g_isAResultCache;
     std::unordered_map<uintptr_t, uint16_t> g_classKindCache;
     ULONGLONG g_lastObjectRefresh = 0;
@@ -1131,6 +1159,18 @@ namespace GameAccess
         g_poseLastFallbackActors.store(0);
         g_poseLastCompletedAt.store(0);
         g_lastPoseRequestAt = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
+            g_visibilityCache.clear();
+            g_visibilityQueue.clear();
+            g_visibilityCacheWorld = 0;
+        }
+        g_visibilityTaskPending.store(false);
+        g_visibilityLastSampleThreadId.store(0);
+        g_visibilityLastRequestedActors.store(0);
+        g_visibilityLastVisibleActors.store(0);
+        g_visibilityLastCompletedAt.store(0);
+        g_lastVisibilityRequestAt = 0;
         g_isAResultCache.clear();
         g_classKindCache.clear();
         g_lastObjectRefresh = 0;
@@ -1559,6 +1599,24 @@ namespace GameAccess
         out.TaskPending = g_poseTaskPending.load();
         return out;
     }
+    VisibilityDiagnostics GetVisibilityDiagnostics()
+    {
+        VisibilityDiagnostics out{};
+        {
+            std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
+            out.CachedActors = static_cast<int32_t>(g_visibilityCache.size());
+            out.QueuedActors = static_cast<int32_t>(g_visibilityQueue.size());
+            for (const auto& item : g_visibilityCache)
+                if (item.second.Visible)
+                    ++out.VisibleActors;
+        }
+        out.LastRequestedActors = g_visibilityLastRequestedActors.load();
+        out.LastVisibleActors = g_visibilityLastVisibleActors.load();
+        out.LastCompletedAt = g_visibilityLastCompletedAt.load();
+        out.LastSampleThreadId = g_visibilityLastSampleThreadId.load();
+        out.TaskPending = g_visibilityTaskPending.load();
+        return out;
+    }
     uintptr_t GetWorld() { return g_diag.World; }
     uintptr_t GetPersistentLevel() { return g_diag.PersistentLevel; }
     uintptr_t GetGameInstance() { return g_diag.GameInstance; }
@@ -1967,6 +2025,232 @@ namespace GameAccess
         {
             g_poseTaskPending.store(false);
             return false;
+        }
+        return true;
+    }
+
+    bool RequestVisibilitySamples(const std::vector<uintptr_t>& actors,
+                                  const std::string& preferredTarget,
+                                  uint32_t minimumIntervalMs)
+    {
+        const uintptr_t world = GetWorld();
+        const uintptr_t library = GetObjectByIndex(
+            ObjectIndices::DefaultGeneralFunctionLibrary);
+        const Camera camera = GetRenderCamera();
+        if (actors.empty() || !world || !library || !camera.Valid ||
+            !GetGameWindowThreadId())
+            return false;
+
+        // Warm the pose cache independently. Visibility work consumes immutable
+        // points only; all reflected ray tests are posted to the game thread below.
+        RequestPoseSamples(actors, std::max<uint32_t>(minimumIntervalMs, 75));
+
+        static constexpr std::array<const char*, 10> BodyTargets = {
+            "head", "neck", "chest", "stomach", "arm_l", "arm_r",
+            "leg_l", "leg_r", "foot_l", "foot_r"
+        };
+
+        std::vector<VisibilityWork> prepared;
+        prepared.reserve(std::min<size_t>(actors.size(), 32));
+        for (const uintptr_t actor : actors)
+        {
+            if (!actor || prepared.size() >= 32 || !IsEnemyCharacter(actor))
+                continue;
+
+            VisibilityWork work{};
+            work.Actor = actor;
+            work.ObserverLocation = camera.Location;
+            if (!GetActorLocation(actor, work.ActorLocation))
+                continue;
+            work.BroadRadius = std::clamp(GetCapsuleHalfHeight(actor) * 0.90f,
+                                          45.0f, 95.0f);
+
+            auto addPoint = [&](const FVector& point)
+            {
+                if (!point.IsFinite() || work.PointCount >= work.Points.size() ||
+                    point.Distance(work.ActorLocation) > 300.0)
+                    return;
+                for (uint8_t index = 0; index < work.PointCount; ++index)
+                    if (work.Points[index].Distance(point) < 2.0)
+                        return;
+                work.Points[work.PointCount++] = point;
+            };
+            auto addTarget = [&](const std::string& name)
+            {
+                FVector point{};
+                if (GetPoseAwareBodyTarget(actor, name, point))
+                    addPoint(point);
+            };
+
+            // The selected bone is tested first. If it is covered, the remaining
+            // live anchors allow an exposed head, torso, arm, leg, or foot to win.
+            addTarget(preferredTarget);
+            for (const char* target : BodyTargets)
+                if (preferredTarget != target)
+                    addTarget(target);
+
+            if (!work.PointCount)
+            {
+                const double halfHeight = static_cast<double>(
+                    GetCapsuleHalfHeight(actor));
+                for (const double factor : { 0.78, 0.58, 0.32, -0.10, -0.48, -0.78 })
+                    addPoint(work.ActorLocation + FVector(0.0, 0.0,
+                        halfHeight * factor));
+            }
+            if (work.PointCount)
+                prepared.push_back(work);
+        }
+        if (prepared.empty())
+            return false;
+
+        {
+            std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
+            if (g_visibilityCacheWorld != world)
+            {
+                g_visibilityCache.clear();
+                g_visibilityQueue.clear();
+                g_visibilityCacheWorld = world;
+            }
+            for (const VisibilityWork& work : prepared)
+            {
+                const auto queued = std::find_if(g_visibilityQueue.begin(),
+                    g_visibilityQueue.end(), [&](const VisibilityWork& item)
+                    { return item.Actor == work.Actor; });
+                if (queued != g_visibilityQueue.end())
+                    *queued = work;
+                else if (g_visibilityQueue.size() < 64)
+                    g_visibilityQueue.push_back(work);
+            }
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        if (g_visibilityTaskPending.load() ||
+            (g_lastVisibilityRequestAt &&
+             now - g_lastVisibilityRequestAt < minimumIntervalMs))
+            return true;
+
+        std::vector<VisibilityWork> requested;
+        {
+            std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
+            const size_t count = std::min<size_t>(g_visibilityQueue.size(), 8);
+            requested.assign(g_visibilityQueue.begin(),
+                             g_visibilityQueue.begin() + count);
+            g_visibilityQueue.erase(g_visibilityQueue.begin(),
+                                    g_visibilityQueue.begin() + count);
+        }
+        if (requested.empty())
+            return false;
+
+        g_lastVisibilityRequestAt = now;
+        g_visibilityLastRequestedActors.store(
+            static_cast<int32_t>(requested.size()));
+        g_visibilityTaskPending.store(true);
+        if (!QueueGameThreadTask([requested = std::move(requested), world, library]()
+            {
+                auto checkSphere = [&](const FVector& observer,
+                                       const FVector& center,
+                                       float radius, int32_t rays)
+                {
+                    alignas(16) std::array<uint8_t, 0x48> params{};
+                    std::memcpy(params.data() + 0x00, &world, sizeof(world));
+                    std::memcpy(params.data() + 0x08, &observer, sizeof(observer));
+                    std::memcpy(params.data() + 0x20, &center, sizeof(center));
+                    std::memcpy(params.data() + 0x38, &radius, sizeof(radius));
+                    std::memcpy(params.data() + 0x3C, &rays, sizeof(rays));
+                    return InvokeFunctionRaw(library,
+                        FunctionIndices::GeneralFunctionLibrary_CheckSphereVisibility,
+                        params.data(), params.size()) && params[0x40] != 0;
+                };
+
+                std::vector<std::pair<uintptr_t, VisibilityCacheEntry>> completed;
+                completed.reserve(requested.size());
+                int32_t visibleCount = 0;
+                for (const VisibilityWork& work : requested)
+                {
+                    VisibilityCacheEntry result{};
+                    result.ActorLocation = work.ActorLocation;
+                    result.SampledAt = GetTickCount64();
+
+                    // One broad test makes the common fully-hidden case cheap. An
+                    // actor that passes is refined against exact body anchors so the
+                    // aimbot never chooses a point that remains behind the wall.
+                    if (GetWorld() == world &&
+                        checkSphere(work.ObserverLocation, work.ActorLocation,
+                                    work.BroadRadius, 9))
+                    {
+                        for (uint8_t index = 0; index < work.PointCount; ++index)
+                        {
+                            if (!checkSphere(work.ObserverLocation,
+                                             work.Points[index], 14.0f, 3))
+                                continue;
+                            result.Visible = true;
+                            result.ExposedPoint = work.Points[index];
+                            ++visibleCount;
+                            break;
+                        }
+                    }
+                    completed.emplace_back(work.Actor, result);
+                }
+
+                const ULONGLONG completedAt = GetTickCount64();
+                {
+                    std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
+                    if (g_visibilityCacheWorld == world)
+                    {
+                        for (const auto& item : completed)
+                            g_visibilityCache[item.first] = item.second;
+                        for (auto it = g_visibilityCache.begin();
+                             it != g_visibilityCache.end();)
+                        {
+                            if (!it->second.SampledAt ||
+                                completedAt - it->second.SampledAt > 2500)
+                                it = g_visibilityCache.erase(it);
+                            else
+                                ++it;
+                        }
+                    }
+                }
+                g_visibilityLastVisibleActors.store(visibleCount);
+                g_visibilityLastSampleThreadId.store(GetCurrentThreadId());
+                g_visibilityLastCompletedAt.store(completedAt);
+                g_visibilityTaskPending.store(false);
+            }, false))
+        {
+            g_visibilityTaskPending.store(false);
+            return false;
+        }
+        return true;
+    }
+
+    bool GetCachedVisibility(uintptr_t actor, bool& outVisible,
+                             FVector* outExposedPoint,
+                             uint32_t maximumAgeMs)
+    {
+        outVisible = false;
+        if (outExposedPoint)
+            *outExposedPoint = {};
+        if (!actor)
+            return false;
+
+        VisibilityCacheEntry cached{};
+        {
+            std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
+            if (g_visibilityCacheWorld != GetWorld())
+                return false;
+            const auto found = g_visibilityCache.find(actor);
+            if (found == g_visibilityCache.end() || !found->second.SampledAt ||
+                GetTickCount64() - found->second.SampledAt > maximumAgeMs)
+                return false;
+            cached = found->second;
+        }
+
+        outVisible = cached.Visible;
+        if (outExposedPoint && cached.Visible)
+        {
+            FVector currentLocation{};
+            const FVector delta = GetActorLocation(actor, currentLocation) ?
+                currentLocation - cached.ActorLocation : FVector{};
+            *outExposedPoint = cached.ExposedPoint + delta;
         }
         return true;
     }
