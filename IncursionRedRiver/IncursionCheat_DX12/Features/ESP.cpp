@@ -260,21 +260,26 @@ namespace ESP
             if (health.Valid && (health.Dead || health.Current <= health.Minimum))
                 continue;
 
-            ++g_lastRenderedCount;
+            // Do not draw an unvalidated actor or an unfinished visibility query.
+            // This removes transient/phantom rectangles during level streaming and
+            // keeps the color contract unambiguous: green is a completed visible
+            // trace, red is a completed occluded trace.
+            bool actorAlive = false;
+            if (!GameAccess::GetCachedActorState(candidate.Actor, actorAlive, 1200) ||
+                !actorAlive)
+                continue;
             bool visible = false;
-            const bool visibilityKnown = candidate.Hostile &&
-                GameAccess::GetCachedVisibility(candidate.Actor, visible,
-                                                nullptr, 800);
-            if (candidate.Hostile)
-            {
-                if (visibilityKnown && visible)
-                    ++g_lastVisibleCount;
-                else
-                    ++g_lastHiddenCount;
-            }
-            const ImU32 color = !candidate.Hostile ? IM_COL32(255, 190, 70, 220) :
-                (visibilityKnown && visible ? IM_COL32(70, 235, 120, 235) :
-                                              IM_COL32(255, 70, 70, 235));
+            const bool visibilityKnown = GameAccess::GetCachedVisibility(
+                candidate.Actor, visible, nullptr, 800);
+            if (!visibilityKnown)
+                continue;
+            ++g_lastRenderedCount;
+            if (visible)
+                ++g_lastVisibleCount;
+            else
+                ++g_lastHiddenCount;
+            const ImU32 color = visible ? IM_COL32(70, 235, 120, 235) :
+                                         IM_COL32(255, 70, 70, 235);
             if (bDrawBoxes)
                 Renderer::DrawBox(left, topY, boxWidth, boxHeight, color, 1.5f);
 
@@ -337,6 +342,6 @@ namespace ESP
             g_lastVisibleCount, g_lastHiddenCount);
         ImGui::TextWrapped("ESP is projected from LastFrameCameraCachePrivate, matching the backbuffer being presented instead of a newer game-thread camera. A small adaptive filter removes sub-frame jitter but responds immediately to real turns and target movement. No per-actor ProcessEvent projection calls are made.");
         ImGui::TextWrapped("Actor discovery is based on actual IRRBaseCharacter class identity and remains independent of local-pawn acquisition; health is a secondary living/dead filter.");
-        ImGui::TextWrapped("Confirmed hostiles share the aimbot's budgeted multi-point exposure cache: green means at least one live body anchor is visible, while red means fully occluded or awaiting a fresh sample. Amber candidates are shown only while the team list is unavailable.");
+        ImGui::TextWrapped("Confirmed hostiles share the aimbot's budgeted multi-point exposure cache: green means at least one live body anchor is visible, while red means a completed trace found the actor occluded. Actors remain hidden until their native state and visibility samples are valid, preventing phantom boxes during streaming.");
     }
 }
