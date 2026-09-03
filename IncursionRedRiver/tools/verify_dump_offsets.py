@@ -41,8 +41,6 @@ EXPECTED = [
     ("Class Engine.PlayerController", "PlayerCameraManager", 0x360),
     ("Class Engine.PlayerController", "bIsLocalPlayerController", 0x6C4),
     ("Class Engine.Actor", "CustomTimeDilation", 0x68),
-    ("Class Engine.Actor", "bHidden", 0x58),
-    ("Class Engine.Actor", "bActorIsBeingDestroyed", 0x5D),
     ("Class Engine.Actor", "Owner", 0x158),
     ("Class Engine.Actor", "RootComponent", 0x1B8),
     ("Class Engine.Actor", "InstanceComponents", 0x280),
