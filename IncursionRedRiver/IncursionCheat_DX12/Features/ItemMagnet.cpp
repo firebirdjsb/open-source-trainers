@@ -30,6 +30,11 @@ namespace
     std::atomic<int> g_lastMatched{ 0 };
     std::atomic<int> g_lastPacked{ 0 };
     std::atomic<int> g_lastStaged{ 0 };
+    std::atomic<int> g_lastTransferAttempts{ 0 };
+    std::atomic<int> g_lastTransferDispatches{ 0 };
+    std::atomic<int> g_lastTransferAccepted{ 0 };
+    std::atomic<int> g_lastLocationAttempts{ 0 };
+    std::atomic<int> g_lastLocationAccepted{ 0 };
     std::atomic<bool> g_taskPending{ false };
     std::atomic<uintptr_t> g_backpackActor{ 0 };
     std::atomic<uintptr_t> g_backpackInventory{ 0 };
@@ -59,7 +64,21 @@ namespace
         const bool dispatched = GameAccess::InvokeFunctionRaw(actor,
             FunctionIndices::Actor_K2_SetActorLocation,
             params.data(), params.size());
-        return dispatched && params[0x121] != 0;
+        if (dispatched && params[0x121] != 0)
+            return true;
+
+        // Some replicated pickup actors reject K2_SetActorLocation while their
+        // scene root is being initialized. The combined transform entry point
+        // follows the same engine path and succeeds once the root is registered.
+        alignas(16) std::array<uint8_t, 0x140> transformParams{};
+        std::memcpy(transformParams.data() + 0x00, &location,
+                    sizeof(location));
+        transformParams[0x30] = 0;   // bSweep
+        transformParams[0x138] = 1;  // bTeleport
+        const bool transformDispatched = GameAccess::InvokeFunctionRaw(actor,
+            FunctionIndices::Actor_K2_SetActorLocationAndRotation,
+            transformParams.data(), transformParams.size());
+        return transformDispatched && transformParams[0x139] != 0;
     }
 
     uintptr_t PickupClass()
@@ -98,10 +117,42 @@ namespace
     uintptr_t SpawnLootBackpack(uintptr_t world, uintptr_t owner,
                                 const FVector& location)
     {
-        const uintptr_t gameplayStatics = GameAccess::GetObjectByIndex(
-            ObjectIndices::DefaultGameplayStatics);
         const uintptr_t backpackClass = GameAccess::GetObjectByIndex(
             ObjectIndices::BPAVSDeltaBackpackClass);
+        if (!backpackClass || !owner)
+            return 0;
+
+        // InventoryComponent::SpawnItem is the game's own construction path. It
+        // creates the pickup actor with its replicated inventory, item payload,
+        // mesh and interaction state initialized. A raw GameplayStatics spawn can
+        // produce a non-zero actor pointer that has no usable component, which is
+        // exactly the zero-packed/zero-staged failure shown by the diagnostics UI.
+        const uintptr_t playerInventory = GameAccess::GetInventoryComponent();
+        if (playerInventory)
+        {
+            alignas(16) std::array<uint8_t, 0x18> spawnParams{};
+            std::memcpy(spawnParams.data() + 0x00, &backpackClass,
+                        sizeof(backpackClass));
+            std::memcpy(spawnParams.data() + 0x08, &owner, sizeof(owner));
+            if (GameAccess::InvokeFunctionRaw(playerInventory,
+                    FunctionIndices::InventoryComponent_SpawnItem,
+                    spawnParams.data(), spawnParams.size()))
+            {
+                uintptr_t actor = 0;
+                std::memcpy(&actor, spawnParams.data() + 0x10, sizeof(actor));
+                if (actor)
+                {
+                    // The actor is already game-owned; only placement remains.
+                    // Keep it even if UE reports a blocked sweep so inventory
+                    // collection can still proceed through its live component.
+                    SetActorLocation(actor, location);
+                    return actor;
+                }
+            }
+        }
+
+        const uintptr_t gameplayStatics = GameAccess::GetObjectByIndex(
+            ObjectIndices::DefaultGameplayStatics);
         if (!gameplayStatics || !backpackClass || !world || !owner)
             return 0;
 
@@ -153,6 +204,7 @@ namespace
 
     bool TransferPickup(uintptr_t pickupActor, uintptr_t backpackInventory)
     {
+        g_lastTransferAttempts.fetch_add(1);
         const uintptr_t sourceInventory = Memory::Read<uintptr_t>(pickupActor +
             Offsets::PickUpActor_InventoryComponent);
         if (!sourceInventory || !backpackInventory)
@@ -173,10 +225,20 @@ namespace
         std::memcpy(params.data() + 0x00, &sourceInventory,
                     sizeof(sourceInventory));
         std::memcpy(params.data() + 0x08, item.data(), item.size());
-        params[0x100] = 1;
-        return GameAccess::InvokeFunctionRaw(backpackInventory,
+        // `bStacked` means merge into an existing stack. A pickup transfer is an
+        // ownership move, so the game's own TryAddItem callers leave this false;
+        // setting it true causes a valid item payload to be rejected by the
+        // backpack container and was the reason every pass reported packed=0.
+        params[0x100] = 0;
+        const bool dispatched = GameAccess::InvokeFunctionRaw(backpackInventory,
             FunctionIndices::InventoryComponent_TryAddItem,
-            params.data(), params.size()) && params[0x101] != 0;
+            params.data(), params.size());
+        if (dispatched)
+            g_lastTransferDispatches.fetch_add(1);
+        const bool accepted = dispatched && params[0x101] != 0;
+        if (accepted)
+            g_lastTransferAccepted.fetch_add(1);
+        return accepted;
     }
 
     void RunMagnet(bool manual)
@@ -228,6 +290,11 @@ namespace
         g_lastMatched.store(matched);
         g_lastPacked.store(0);
         g_lastStaged.store(0);
+        g_lastTransferAttempts.store(0);
+        g_lastTransferDispatches.store(0);
+        g_lastTransferAccepted.store(0);
+        g_lastLocationAttempts.store(0);
+        g_lastLocationAccepted.store(0);
         if (pickups.empty() && !manual)
         {
             SetStatus("Loot backpack: no pickup actors in %.0f m", g_rangeMeters);
@@ -273,18 +340,33 @@ namespace
                                                             backpackInventory))
                     {
                         ++packed;
+                        // TryAddItem moves the live ContainerItem into the
+                        // backpack inventory, but the original world pickup can
+                        // remain until its replicated pickup state catches up.
+                        // Put that actor at the container as a visible fallback;
+                        // it prevents successfully packed items from being left
+                        // scattered across the raid while the server update runs.
+                        g_lastLocationAttempts.fetch_add(1);
+                        if (SetActorLocation(pickup, containerLocation))
+                            g_lastLocationAccepted.fetch_add(1);
                         continue;
                     }
+                    g_lastLocationAttempts.fetch_add(1);
                     if (SetActorLocation(pickup,
                             StagingDestination(containerLocation, ordinal++)))
+                    {
+                        g_lastLocationAccepted.fetch_add(1);
                         ++staged;
+                    }
                 }
 
                 g_lastPacked.store(packed);
                 g_lastStaged.store(staged);
                 if (backpack && backpackInventory)
-                    SetStatus("Loot backpack: %d packed, %d staged beside it%s",
-                        packed, staged, manual ? " (manual)" : "");
+                    SetStatus("Loot backpack: %d packed, %d staged | transfer %d/%d | move %d/%d%s",
+                        packed, staged, g_lastTransferAccepted.load(),
+                        g_lastTransferAttempts.load(), g_lastLocationAccepted.load(),
+                        g_lastLocationAttempts.load(), manual ? " (manual)" : "");
                 else
                     SetStatus("Backpack spawn failed; %d pickups staged in front%s",
                         staged, manual ? " (manual)" : "");
@@ -323,6 +405,11 @@ namespace ItemMagnet
         g_lastMatched.store(0);
         g_lastPacked.store(0);
         g_lastStaged.store(0);
+        g_lastTransferAttempts.store(0);
+        g_lastTransferDispatches.store(0);
+        g_lastTransferAccepted.store(0);
+        g_lastLocationAttempts.store(0);
+        g_lastLocationAccepted.store(0);
         g_backpackActor.store(0);
         g_backpackInventory.store(0);
         g_backpackWorld.store(0);
@@ -370,6 +457,10 @@ namespace ItemMagnet
             g_taskPending.load() ? "RUNNING" : "IDLE");
         ImGui::Text("Last pass: matched %d | packed %d | staged %d",
             g_lastMatched.load(), g_lastPacked.load(), g_lastStaged.load());
+        ImGui::Text("Transfers: accepted %d / dispatched %d / attempted %d | moves: %d / %d",
+            g_lastTransferAccepted.load(), g_lastTransferDispatches.load(),
+            g_lastTransferAttempts.load(), g_lastLocationAccepted.load(),
+            g_lastLocationAttempts.load());
         char status[sizeof(g_status)]{};
         {
             std::lock_guard<std::mutex> lock(g_statusMutex);

@@ -243,6 +243,9 @@ namespace FunctionIndices
     constexpr int32_t GameplayStatics_FinishSpawningActor = 0x5507;
     constexpr int32_t SenseStimulusComponent_SetInvisibleServer = 0x5FC4;
     constexpr int32_t Actor_K2_SetActorLocation = 0x296F;
+    constexpr int32_t Actor_K2_SetActorLocationAndRotation = 0x2970;
+    constexpr int32_t Controller_GetPlayerViewPoint = 0x29B2;
+    constexpr int32_t Controller_LineOfSightTo = 0x29BA;
     constexpr int32_t GeneralGameInstance_CompleteTrackedMissions = 0x6B70;
     constexpr int32_t GeneralGameInstance_FailTrackedMissions = 0x6B74;
     constexpr int32_t GeneralGameInstance_ForceExtraction = 0x6B76;
@@ -282,6 +285,7 @@ namespace FunctionIndices
     constexpr int32_t GeneralGameInstance_SetOverallFactionReputation = 0x6B95;
     constexpr int32_t FirstPersonStamina_GetCurrentStamina = 0x6B0D;
     constexpr int32_t InventoryComponent_AddDefaultItem = 0x6C1A;
+    constexpr int32_t InventoryComponent_SpawnItem = 0x6CA0;
     constexpr int32_t InventoryComponent_CanAddToInventory = 0x6C2B;
     constexpr int32_t InventoryComponent_TryAddItem = 0x6CA3;
     constexpr int32_t InventoryComponent_ItemsUpdated = 0x6C78;

@@ -29,6 +29,8 @@ namespace
         bool CapsuleFallback = false;
         bool PoseAware = false;
         uintptr_t BodyComponent = 0;
+        bool VisibilityKnown = false;
+        bool VisibilityVisible = false;
     };
 
     double NormalizeAngle(double angle)
@@ -240,7 +242,7 @@ namespace Aimbot
             if (screenDistance <= coarseRadius)
                 candidates.push_back({ actor, target, screen, screenDistance,
                                        usedCapsuleFallback, usedPoseAwareTarget,
-                                       targetBodyComponent });
+                                       targetBodyComponent, false, false });
         }
 
         if (candidates.empty())
@@ -309,8 +311,10 @@ namespace Aimbot
         }
 
         // Visibility is one shared, game-thread sampled result. The selected point
-        // is tested first, followed by every major body anchor. Fully occluded actors
-        // are rejected, while a visible limb can supply the actual safe aim point.
+        // is tested first, followed by every major body anchor. A cache miss must
+        // never erase the candidate or its marker: the asynchronous sampler needs a
+        // frame to complete, and dropping it here made the yellow marker disappear
+        // and made aiming appear broken whenever the trace helper was late.
         std::vector<uintptr_t> visibilityActors;
         visibilityActors.reserve(candidates.size());
         for (const AimCandidate& candidate : candidates)
@@ -324,17 +328,17 @@ namespace Aimbot
             FVector exposed{};
             const bool known = GameAccess::GetCachedVisibility(candidate.Actor,
                 visible, &exposed, g_aimDiagnostics.ActivationHeld ? 550u : 900u);
+            candidate.VisibilityKnown = known;
+            candidate.VisibilityVisible = known && visible;
             if (!known)
             {
                 ++g_aimDiagnostics.VisibilityUnknownTargets;
-                candidate.ScreenDistance = std::numeric_limits<float>::infinity();
                 continue;
             }
             ++g_aimDiagnostics.VisibilityKnownTargets;
             if (!visible)
             {
                 ++g_aimDiagnostics.VisibilityHiddenTargets;
-                candidate.ScreenDistance = std::numeric_limits<float>::infinity();
                 continue;
             }
             ++g_aimDiagnostics.VisibilityVisibleTargets;
@@ -344,19 +348,25 @@ namespace Aimbot
                     exposedScreen, camera.Location, camera.Rotation, camera.FOV,
                     static_cast<int>(display.x), static_cast<int>(display.y)))
             {
-                candidate.ScreenDistance = std::numeric_limits<float>::infinity();
                 continue;
             }
             const float dx = exposedScreen.x - center.x;
             const float dy = exposedScreen.y - center.y;
-            candidate.Target = exposed;
-            candidate.Screen = exposedScreen;
-            candidate.ScreenDistance = std::sqrt(dx * dx + dy * dy);
+            const float exposedDistance = std::sqrt(dx * dx + dy * dy);
+            // Keep the original body target if the exposed anchor is outside the
+            // configured FOV. It is still a valid visibility result, but replacing
+            // the selected bone with an off-screen point would incorrectly prevent
+            // a lock that is already inside the user's FOV.
+            if (exposedDistance <= fovRadius)
+            {
+                candidate.Target = exposed;
+                candidate.Screen = exposedScreen;
+                candidate.ScreenDistance = exposedDistance;
+            }
         }
         candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-            [&](const AimCandidate& candidate)
-            { return !std::isfinite(candidate.ScreenDistance) ||
-                     candidate.ScreenDistance > fovRadius; }), candidates.end());
+            [](const AimCandidate& candidate)
+            { return !std::isfinite(candidate.ScreenDistance); }), candidates.end());
         std::sort(candidates.begin(), candidates.end(),
             [](const AimCandidate& left, const AimCandidate& right)
             { return left.ScreenDistance < right.ScreenDistance; });
@@ -366,19 +376,37 @@ namespace Aimbot
             return;
         }
 
+        // The marker is deliberately independent from trace completion. This gives
+        // immediate feedback while the game-thread LOS sample is in flight, while
+        // the actual aim submission below still requires a known visible target.
+        const AimCandidate* marker = nullptr;
+        for (const AimCandidate& candidate : candidates)
+        {
+            if (candidate.ScreenDistance <= fovRadius)
+            {
+                marker = &candidate;
+                break;
+            }
+        }
+
         const AimCandidate* best = nullptr;
         const AimCandidate* locked = nullptr;
         if (g_lockedActor && g_aimDiagnostics.ActivationHeld)
         {
             const auto foundLock = std::find_if(candidates.begin(), candidates.end(),
                 [](const AimCandidate& candidate)
-                { return candidate.Actor == g_lockedActor; });
+                { return candidate.Actor == g_lockedActor &&
+                         candidate.VisibilityKnown && candidate.VisibilityVisible &&
+                         candidate.ScreenDistance <= fovRadius; });
             if (foundLock != candidates.end())
                 locked = &*foundLock;
         }
 
         for (const AimCandidate& candidate : candidates)
         {
+            if (!candidate.VisibilityKnown || !candidate.VisibilityVisible ||
+                candidate.ScreenDistance > fovRadius)
+                continue;
             if (locked && candidate.Actor == locked->Actor)
                 continue;
             best = &candidate;
@@ -399,6 +427,13 @@ namespace Aimbot
         if (!best)
         {
             g_lockedActor = 0;
+            if (marker)
+            {
+                g_aimDiagnostics.TargetActor = marker->Actor;
+                g_aimDiagnostics.TargetWorld = marker->Target;
+                Renderer::DrawCircle(marker->Screen.x, marker->Screen.y, 7.0f,
+                                     IM_COL32(255, 215, 0, 180));
+            }
             return;
         }
 

@@ -2036,6 +2036,7 @@ namespace GameAccess
         const uintptr_t world = GetWorld();
         const uintptr_t library = GetObjectByIndex(
             ObjectIndices::DefaultGeneralFunctionLibrary);
+        const uintptr_t controller = GetLocalController();
         const Camera camera = GetRenderCamera();
         if (actors.empty() || !world || !library || !camera.Valid ||
             !GetGameWindowThreadId())
@@ -2145,8 +2146,44 @@ namespace GameAccess
         g_visibilityLastRequestedActors.store(
             static_cast<int32_t>(requested.size()));
         g_visibilityTaskPending.store(true);
-        if (!QueueGameThreadTask([requested = std::move(requested), world, library]()
+        if (!QueueGameThreadTask([requested = std::move(requested), world,
+                                  library, controller]()
             {
+                // Controller::LineOfSightTo is the engine's authoritative trace and
+                // remains reliable when the Blueprint sphere helper has not warmed
+                // its camera/context state yet.  Keep the Blueprint sampler as the
+                // multi-point fallback so a visible limb can still unlock a target.
+                auto controllerViewPoint = [&](FVector& outLocation)
+                {
+                    if (!controller)
+                        return false;
+                    alignas(16) std::array<uint8_t, 0x30> params{};
+                    if (!InvokeFunctionRaw(controller,
+                            FunctionIndices::Controller_GetPlayerViewPoint,
+                            params.data(), params.size()))
+                        return false;
+                    std::memcpy(&outLocation, params.data(), sizeof(outLocation));
+                    return outLocation.IsFinite();
+                };
+
+                FVector engineViewPoint{};
+                const bool haveEngineViewPoint = controllerViewPoint(engineViewPoint);
+
+                auto controllerLineOfSight = [&](uintptr_t actor,
+                                                  const FVector& viewpoint)
+                {
+                    if (!controller || !actor || !viewpoint.IsFinite())
+                        return false;
+                    alignas(16) std::array<uint8_t, 0x28> params{};
+                    std::memcpy(params.data() + 0x00, &actor, sizeof(actor));
+                    std::memcpy(params.data() + 0x08, &viewpoint,
+                                sizeof(viewpoint));
+                    params[0x20] = 0; // bAlternateChecks
+                    return InvokeFunctionRaw(controller,
+                        FunctionIndices::Controller_LineOfSightTo,
+                        params.data(), params.size()) && params[0x21] != 0;
+                };
+
                 auto checkSphere = [&](const FVector& observer,
                                        const FVector& center,
                                        float radius, int32_t rays)
@@ -2170,23 +2207,40 @@ namespace GameAccess
                     VisibilityCacheEntry result{};
                     result.ActorLocation = work.ActorLocation;
                     result.SampledAt = GetTickCount64();
+                    const FVector observer = haveEngineViewPoint ?
+                        engineViewPoint : work.ObserverLocation;
 
-                    // One broad test makes the common fully-hidden case cheap. An
-                    // actor that passes is refined against exact body anchors so the
-                    // aimbot never chooses a point that remains behind the wall.
-                    if (GetWorld() == world &&
-                        checkSphere(work.ObserverLocation, work.ActorLocation,
-                                    work.BroadRadius, 9))
+                    // Prefer the native actor trace. It tests the actual actor and
+                    // avoids the false-negative window while CheckSphereVisibility
+                    // is still waiting for its Blueprint camera context. Once the
+                    // actor is known visible, retain the selected body point and use
+                    // sphere samples only to find a more exposed limb/anchor.
+                    const bool actorVisible = GetWorld() == world &&
+                        controllerLineOfSight(work.Actor, observer);
+                    const bool broadVisible = !actorVisible && GetWorld() == world &&
+                        checkSphere(observer, work.ActorLocation,
+                                    work.BroadRadius, 9);
+                    if (actorVisible || broadVisible)
                     {
                         for (uint8_t index = 0; index < work.PointCount; ++index)
                         {
-                            if (!checkSphere(work.ObserverLocation,
+                            if (!actorVisible && !checkSphere(observer,
                                              work.Points[index], 14.0f, 3))
                                 continue;
                             result.Visible = true;
                             result.ExposedPoint = work.Points[index];
                             ++visibleCount;
                             break;
+                        }
+                        // A native actor trace can succeed even when an individual
+                        // tiny sphere sample is rejected at an animation seam. Keep
+                        // the requested point in that case instead of reporting a
+                        // fully hidden actor and disabling target acquisition.
+                        if (actorVisible && !result.Visible && work.PointCount)
+                        {
+                            result.Visible = true;
+                            result.ExposedPoint = work.Points[0];
+                            ++visibleCount;
                         }
                     }
                     completed.emplace_back(work.Actor, result);
