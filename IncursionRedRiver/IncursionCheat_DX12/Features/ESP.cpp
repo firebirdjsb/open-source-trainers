@@ -149,7 +149,6 @@ namespace ESP
             g_screenTracks.clear();
         }
 
-        const auto& diagnostics = GameAccess::GetDiagnostics();
         std::vector<Candidate> candidates;
         candidates.reserve(GameAccess::GetCharacters().size());
         for (const uintptr_t actor : GameAccess::GetCharacters())
@@ -157,7 +156,10 @@ namespace ESP
             if (actor == localPawn)
                 continue;
             const bool confirmedHostile = GameAccess::IsEnemyCharacter(actor);
-            if (diagnostics.HostileArrayValid && !confirmedHostile)
+            // Only confirmed hostiles are rendered. Neutral/unknown IRR actors
+            // are intentionally omitted instead of being mislabeled as Enemy
+            // when the transient team list is unavailable.
+            if (!confirmedHostile)
                 continue;
 
             FVector location{};

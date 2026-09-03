@@ -54,6 +54,9 @@ namespace Offsets
     constexpr uintptr_t APlayerController_bIsLocalController  = 0x6C4;
 
     constexpr uintptr_t AActor_CustomTimeDilation = 0x68;
+    // Native AActor flag bytes (the dump lists these as bitfield BoolProperties).
+    constexpr uintptr_t AActor_Flags0 = 0x58; // bHidden is bit 6
+    constexpr uintptr_t AActor_Flags5 = 0x5D; // bActorIsBeingDestroyed is bit 1
     constexpr uintptr_t AActor_Owner              = 0x158;
     constexpr uintptr_t AActor_RootComponent       = 0x1B8;
     constexpr uintptr_t AActor_InstanceComponents  = 0x280;

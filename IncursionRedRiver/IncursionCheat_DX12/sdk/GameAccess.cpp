@@ -186,6 +186,24 @@ namespace
     bool ClassIsChildOf(uintptr_t objectClass, uintptr_t targetClass);
     bool IsObjectOfClass(uintptr_t object, uintptr_t targetClass);
 
+    bool IsLiveActor(uintptr_t actor)
+    {
+        if (!actor || !Memory::IsReadable(actor + Offsets::AActor_Flags0, 1) ||
+            !Memory::IsReadable(actor + Offsets::AActor_Flags5, 1))
+            return false;
+        uint8_t flags0 = 0;
+        uint8_t flags5 = 0;
+        if (!Memory::TryRead(actor + Offsets::AActor_Flags0, flags0) ||
+            !Memory::TryRead(actor + Offsets::AActor_Flags5, flags5) ||
+            (flags0 & 0x40u) != 0 || // AActor::bHidden
+            (flags5 & 0x02u) != 0)   // AActor::bActorIsBeingDestroyed
+            return false;
+        const uintptr_t root = Memory::Read<uintptr_t>(actor +
+            Offsets::AActor_RootComponent);
+        return root && Memory::IsReadable(root +
+            Offsets::USceneComponent_RelativeLocation, sizeof(FVector));
+    }
+
     bool ReadBodyPoseDirect(uintptr_t actor, const PoseCacheEntry* previous,
                             PoseCacheEntry& out)
     {
@@ -1422,14 +1440,15 @@ namespace GameAccess
         std::unordered_set<uintptr_t> seenCharacters;
         for (const uintptr_t actor : g_actors)
         {
-            if (IsObjectOfClass(actor, g_classes.IRRBaseCharacter) &&
+            if (IsLiveActor(actor) &&
+                IsObjectOfClass(actor, g_classes.IRRBaseCharacter) &&
                 seenCharacters.insert(actor).second)
                 g_characters.push_back(actor);
         }
         for (const uintptr_t object : g_characterObjects)
         {
             ++g_diag.ScannedCharacterCount;
-            if (ObjectBelongsToWorld(object, g_diag.World) &&
+            if (IsLiveActor(object) && ObjectBelongsToWorld(object, g_diag.World) &&
                 seenCharacters.insert(object).second)
                 g_characters.push_back(object);
         }
@@ -1658,10 +1677,10 @@ namespace GameAccess
         if (g_classes.IRRAIBaseCharacter &&
             IsObjectOfClass(actor, g_classes.IRRAIBaseCharacter))
             return true;
-        // When no validated hostility data exists, retain typed IRR candidates so
-        // ESP/aim acquisition remains operational. A populated hostile list still
-        // wins for players and neutral actors, avoiding broad false positives.
-        return !g_diag.HostileArrayValid;
+        // Do not broaden an unavailable team list to every IRRBaseCharacter: that
+        // made stale/neutral actors appear as enemies. In a raid, the validated AI
+        // class is the safe fallback until Hostiles replicates.
+        return false;
     }
 
     bool InvokeFunctionRaw(uintptr_t object, int32_t functionIndex,
