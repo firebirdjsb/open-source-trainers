@@ -2182,16 +2182,29 @@ namespace GameAccess
                 auto controllerLineOfSight = [&](uintptr_t actor,
                                                   const FVector& viewpoint)
                 {
-                    if (!controller || !actor || !viewpoint.IsFinite())
+                    if (!controller || !actor)
                         return false;
-                    alignas(16) std::array<uint8_t, 0x28> params{};
-                    std::memcpy(params.data() + 0x00, &actor, sizeof(actor));
-                    std::memcpy(params.data() + 0x08, &viewpoint,
-                                sizeof(viewpoint));
-                    params[0x20] = 0; // bAlternateChecks
-                    return InvokeFunctionRaw(controller,
-                        FunctionIndices::Controller_LineOfSightTo,
-                        params.data(), params.size()) && params[0x21] != 0;
+                    auto invoke = [&](const FVector& point)
+                    {
+                        alignas(16) std::array<uint8_t, 0x28> params{};
+                        std::memcpy(params.data() + 0x00, &actor, sizeof(actor));
+                        std::memcpy(params.data() + 0x08, &point, sizeof(point));
+                        params[0x20] = 0; // bAlternateChecks
+                        return InvokeFunctionRaw(controller,
+                            FunctionIndices::Controller_LineOfSightTo,
+                            params.data(), params.size()) && params[0x21] != 0;
+                    };
+
+                    // UE's documented/native convention is a zero ViewPoint:
+                    // LineOfSightTo then asks the controller for its current eye
+                    // location. Passing a cached render-camera position here can
+                    // be one frame stale and made every open target look hidden.
+                    if (invoke(FVector{}))
+                        return true;
+                    // Keep the current engine viewpoint as a secondary probe for
+                    // custom controller implementations that do not honor zero.
+                    return viewpoint.IsFinite() && viewpoint.Length() > 1.0 &&
+                        invoke(viewpoint);
                 };
 
                 auto checkSphere = [&](const FVector& observer,
