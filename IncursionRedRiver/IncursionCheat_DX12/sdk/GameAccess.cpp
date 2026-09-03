@@ -1437,10 +1437,10 @@ namespace GameAccess
         if (!g_characters.empty())
             g_diag.WorldIsActiveRaid = true;
 
-        // Use the game's own per-player hostility list. This avoids treating every
-        // non-local IRR character (including co-op players or neutral factions) as an
-        // enemy. ESP may still render typed candidates when this list is unavailable,
-        // but aimbot selection requires membership in this validated list.
+        // Use the game's own per-player hostility list when it is populated. The
+        // list is transient during map travel and can legitimately be empty for a
+        // few frames, so IsEnemyCharacter also falls back to the dump-validated AI
+        // class instead of making the aimbot wait forever for a team array.
         if (g_diag.Pawn)
         {
             g_diag.LocalTeamComponent = Memory::Read<uintptr_t>(g_diag.Pawn +
@@ -1650,8 +1650,18 @@ namespace GameAccess
     {
         if (!actor || actor == GetLocalPawn() || !IsIRRCharacter(actor))
             return false;
-        return g_diag.HostileArrayValid &&
-               g_hostileCharacters.find(actor) != g_hostileCharacters.end();
+        if (g_hostileCharacters.find(actor) != g_hostileCharacters.end())
+            return true;
+        // AI characters are the only non-local combatants in a solo raid. This
+        // fallback also covers the short interval before TeamComponent::Hostiles
+        // has replicated, which previously left zero aimbot candidates.
+        if (g_classes.IRRAIBaseCharacter &&
+            IsObjectOfClass(actor, g_classes.IRRAIBaseCharacter))
+            return true;
+        // When no validated hostility data exists, retain typed IRR candidates so
+        // ESP/aim acquisition remains operational. A populated hostile list still
+        // wins for players and neutral actors, avoiding broad false positives.
+        return !g_diag.HostileArrayValid;
     }
 
     bool InvokeFunctionRaw(uintptr_t object, int32_t functionIndex,
@@ -2055,7 +2065,7 @@ namespace GameAccess
         prepared.reserve(std::min<size_t>(actors.size(), 32));
         for (const uintptr_t actor : actors)
         {
-            if (!actor || prepared.size() >= 32 || !IsEnemyCharacter(actor))
+            if (!actor || prepared.size() >= 128 || !IsEnemyCharacter(actor))
                 continue;
 
             VisibilityWork work{};
@@ -2119,7 +2129,7 @@ namespace GameAccess
                     { return item.Actor == work.Actor; });
                 if (queued != g_visibilityQueue.end())
                     *queued = work;
-                else if (g_visibilityQueue.size() < 64)
+                else if (g_visibilityQueue.size() < 128)
                     g_visibilityQueue.push_back(work);
             }
         }
@@ -2133,7 +2143,7 @@ namespace GameAccess
         std::vector<VisibilityWork> requested;
         {
             std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
-            const size_t count = std::min<size_t>(g_visibilityQueue.size(), 8);
+            const size_t count = std::min<size_t>(g_visibilityQueue.size(), 16);
             requested.assign(g_visibilityQueue.begin(),
                              g_visibilityQueue.begin() + count);
             g_visibilityQueue.erase(g_visibilityQueue.begin(),

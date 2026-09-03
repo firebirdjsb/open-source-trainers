@@ -316,9 +316,18 @@ namespace Aimbot
         // frame to complete, and dropping it here made the yellow marker disappear
         // and made aiming appear broken whenever the trace helper was late.
         std::vector<uintptr_t> visibilityActors;
-        visibilityActors.reserve(candidates.size());
-        for (const AimCandidate& candidate : candidates)
+        // Only the closest crosshair shortlist needs aim visibility. ESP owns the
+        // broader on-screen visibility queue; limiting this request prevents an
+        // enabled-but-idle aimbot from continuously replacing that queue and keeps
+        // ADS/fire acquisition under a small, predictable budget.
+        const size_t visibilityLimit = g_aimDiagnostics.ActivationHeld ? 8u : 16u;
+        visibilityActors.reserve(std::min(candidates.size(), visibilityLimit));
+        for (size_t index = 0; index < candidates.size() &&
+             index < visibilityLimit; ++index)
+        {
+            const AimCandidate& candidate = candidates[index];
             visibilityActors.push_back(candidate.Actor);
+        }
         GameAccess::RequestVisibilitySamples(visibilityActors, selectedBone,
             g_aimDiagnostics.ActivationHeld ? 65u : 140u);
 
@@ -431,8 +440,8 @@ namespace Aimbot
             {
                 g_aimDiagnostics.TargetActor = marker->Actor;
                 g_aimDiagnostics.TargetWorld = marker->Target;
-                Renderer::DrawCircle(marker->Screen.x, marker->Screen.y, 7.0f,
-                                     IM_COL32(255, 215, 0, 180));
+                Renderer::DrawCircle(marker->Screen.x, marker->Screen.y, 4.0f,
+                                     IM_COL32(255, 215, 0, 180), 1.0f);
             }
             return;
         }
@@ -494,8 +503,8 @@ namespace Aimbot
         g_aimDiagnostics.UsedExposedPoint = true;
 
         // Gold marker confirms that a target was acquired and shows the exact aim point.
-        Renderer::DrawCircle(chosen.Screen.x, chosen.Screen.y, 7.0f,
-                             IM_COL32(255, 215, 0, 230));
+        Renderer::DrawCircle(chosen.Screen.x, chosen.Screen.y, 4.0f,
+                             IM_COL32(255, 215, 0, 230), 1.0f);
 
         // ADS/RMB and firing/LMB share the same selected-bone activation path.
         if (!g_aimDiagnostics.ActivationHeld)

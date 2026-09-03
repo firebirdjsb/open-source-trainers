@@ -1,5 +1,6 @@
 #include "ESP.h"
 
+#include "../Menu.h"
 #include "../sdk/GameAccess.h"
 #include "../utils/Renderer.h"
 #include "../utils/WorldToScreen.h"
@@ -42,6 +43,7 @@ namespace
         float DistanceMeters = 0.0f;
         float HalfHeight = 88.0f;
         bool Hostile = false;
+        bool OnScreen = false;
     };
 
     std::string Narrow(const std::wstring& input)
@@ -78,8 +80,8 @@ namespace
                                            newCenterY - oldCenterY);
             // Suppress only tiny game/render-thread timing noise. Real camera turns
             // and actor movement use a high response so the box cannot trail behind.
-            const float alpha = delta < 6.0f ? 0.22f :
-                                (delta < 20.0f ? 0.62f : 0.92f);
+            const float alpha = delta < 6.0f ? 0.80f :
+                                (delta < 20.0f ? 0.95f : 1.0f);
             track.Top.x += (rawTop.x - track.Top.x) * alpha;
             track.Top.y += (rawTop.y - track.Top.y) * alpha;
             track.Bottom.x += (rawBottom.x - track.Bottom.x) * alpha;
@@ -100,7 +102,7 @@ namespace ESP
     bool bShowNames = true;
     bool bShowDistance = true;
     float maxDistanceMeters = 150.0f;
-    int maxActors = 25;
+    int maxActors = 128;
 
     void Init() {}
     void Enable() { bEnabled = true; }
@@ -115,7 +117,10 @@ namespace ESP
         g_lastVisibleCount = 0;
         g_lastHiddenCount = 0;
 
-        if (!bEnabled || !ImGui::GetCurrentContext())
+        // The menu owns the foreground draw list while open. Skipping the world
+        // overlay here removes redundant projection, name-cache and visibility
+        // work during menu interaction without changing the menu itself.
+        if (!bEnabled || Menu::bOpen || !ImGui::GetCurrentContext())
             return;
 
         const uintptr_t localPawn = GameAccess::GetLocalPawn();
@@ -163,28 +168,61 @@ namespace ESP
             if (distanceMeters > maxDistanceMeters)
                 continue;
 
+            Vector2 centerScreen{};
+            const bool projected = WorldToScreen::Convert(location, centerScreen,
+                camera.Location, camera.Rotation, camera.FOV, width, height);
+            const bool onScreen = projected && centerScreen.x >= -80.0f &&
+                centerScreen.x <= display.x + 80.0f && centerScreen.y >= -80.0f &&
+                centerScreen.y <= display.y + 80.0f;
             candidates.push_back({ actor, location, distanceMeters,
                                    GameAccess::GetCapsuleHalfHeight(actor),
-                                   confirmedHostile });
+                                   confirmedHostile, onScreen });
         }
 
         g_lastCandidateCount = static_cast<int>(candidates.size());
         std::sort(candidates.begin(), candidates.end(),
             [](const Candidate& a, const Candidate& b)
-            { return a.DistanceMeters < b.DistanceMeters; });
+            {
+                if (a.OnScreen != b.OnScreen)
+                    return a.OnScreen > b.OnScreen;
+                return a.DistanceMeters < b.DistanceMeters;
+            });
 
-        std::vector<uintptr_t> visibilityActors;
-        const size_t sampleCount = std::min<size_t>(candidates.size(),
-            static_cast<size_t>(std::max(maxActors, 1)));
-        visibilityActors.reserve(sampleCount);
-        for (size_t index = 0; index < sampleCount; ++index)
-            if (candidates[index].Hostile)
-                visibilityActors.push_back(candidates[index].Actor);
-        GameAccess::RequestVisibilitySamples(visibilityActors, "chest", 120);
-
+        // Prioritize hostile actors that are actually on screen instead of taking
+        // the nearest N actors (which can spend the entire async budget on enemies
+        // behind the camera). This keeps red/green state responsive for every
+        // visible target while projection remains a cheap local math operation.
+        struct VisibilityPriority { uintptr_t Actor = 0; float Score = 0.0f; };
+        std::vector<VisibilityPriority> priorities;
+        priorities.reserve(candidates.size());
         for (const Candidate& candidate : candidates)
         {
-            if (g_lastRenderedCount >= std::max(maxActors, 1))
+            if (!candidate.Hostile)
+                continue;
+            Vector2 screen{};
+            const bool projected = WorldToScreen::Convert(candidate.Location, screen,
+                camera.Location, camera.Rotation, camera.FOV, width, height);
+            const bool onScreen = projected && screen.x >= -80.0f &&
+                screen.x <= display.x + 80.0f && screen.y >= -80.0f &&
+                screen.y <= display.y + 80.0f;
+            const float score = onScreen ?
+                std::hypot(screen.x - display.x * 0.5f,
+                           screen.y - display.y * 0.5f) : 1000000000.0f;
+            priorities.push_back({ candidate.Actor, score });
+        }
+        std::sort(priorities.begin(), priorities.end(),
+            [](const VisibilityPriority& left, const VisibilityPriority& right)
+            { return left.Score < right.Score; });
+        std::vector<uintptr_t> visibilityActors;
+        visibilityActors.reserve(priorities.size());
+        for (const VisibilityPriority& priority : priorities)
+            visibilityActors.push_back(priority.Actor);
+        GameAccess::RequestVisibilitySamples(visibilityActors, "chest", 120);
+
+        const int renderLimit = std::max(maxActors, 1);
+        for (const Candidate& candidate : candidates)
+        {
+            if (g_lastRenderedCount >= renderLimit)
                 break;
 
             const FVector topWorld = candidate.Location + FVector(
@@ -286,8 +324,8 @@ namespace ESP
         ImGui::Checkbox("Names", &bShowNames);
         ImGui::Checkbox("Distance", &bShowDistance);
         ImGui::SliderFloat("Max Distance", &maxDistanceMeters, 25.0f, 1000.0f, "%.0f m");
-        ImGui::SliderInt("Max On-screen Actors", &maxActors, 5, 100);
-        ImGui::Text("On-screen candidates: %d | rendered: %d",
+        ImGui::SliderInt("Max On-screen Actors", &maxActors, 5, 256);
+        ImGui::Text("Candidates in range: %d | rendered: %d",
             g_lastCandidateCount, g_lastRenderedCount);
         ImGui::Text("Exposure: %d visible (green) | %d hidden/pending (red)",
             g_lastVisibleCount, g_lastHiddenCount);

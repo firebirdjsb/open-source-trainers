@@ -9,6 +9,7 @@
 #include "Features/TacticalTools.h"
 #include "Features/MovementTools.h"
 #include "Features/WorldTools.h"
+#include "Menu.h"
 
 #include <Windows.h>
 
@@ -51,7 +52,8 @@ void CheatManager::Tick()
     // class tests, hostile-list reads and bone validation no longer tax every frame.
     // Before a pawn is acquired, refresh quickly so loader-before-game startup is
     // still responsive.
-    const uint64_t refreshInterval = GameAccess::GetLocalPawn() ? 33u : 8u;
+    const uint64_t refreshInterval = Menu::bOpen ? 150u :
+        (GameAccess::GetLocalPawn() ? 33u : 8u);
     if (!m_lastRuntimeRefreshMs || now - m_lastRuntimeRefreshMs >= refreshInterval)
     {
         GameAccess::Refresh();

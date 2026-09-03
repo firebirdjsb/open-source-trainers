@@ -9,14 +9,15 @@ namespace Renderer
         ImGui::GetBackgroundDrawList()->PushClipRectFullScreen();
     }
 
-    inline void DrawCircle(float x, float y, float radius, ImU32 color)
+    inline void DrawCircle(float x, float y, float radius, ImU32 color,
+                           float thickness = 2.0f)
     {
         ImGui::GetBackgroundDrawList()->AddCircle(
             ImVec2(x, y),
             radius,
             color,
             0,  // segments
-            2.0f // thickness
+            thickness
         );
     }
 
