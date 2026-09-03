@@ -182,8 +182,9 @@ namespace
             ImGui::Text("Exposure candidates: known %d | visible %d | hidden %d | pending %d",
                 a.VisibilityKnownTargets, a.VisibilityVisibleTargets,
                 a.VisibilityHiddenTargets, a.VisibilityUnknownTargets);
-            ImGui::Text("Exposure cache: %d actors / %d visible | queued %d | task %s",
+            ImGui::Text("Exposure cache: %d actors / %d visible | actor state %d known (%d destroyed) | queued %d | task %s",
                 visibility.CachedActors, visibility.VisibleActors,
+                visibility.ActorStateKnown, visibility.DestroyedActors,
                 visibility.QueuedActors, visibility.TaskPending ? "PENDING" : "IDLE");
             ImGui::Text("Exposure game thread: 0x%X | last batch %d / visible %d",
                 visibility.LastSampleThreadId, visibility.LastRequestedActors,

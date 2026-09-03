@@ -1637,8 +1637,16 @@ namespace GameAccess
             out.CachedActors = static_cast<int32_t>(g_visibilityCache.size());
             out.QueuedActors = static_cast<int32_t>(g_visibilityQueue.size());
             for (const auto& item : g_visibilityCache)
+            {
                 if (item.second.Visible)
                     ++out.VisibleActors;
+                if (item.second.ActorStateKnown)
+                {
+                    ++out.ActorStateKnown;
+                    if (item.second.ActorDestroyed)
+                        ++out.DestroyedActors;
+                }
+            }
         }
         out.LastRequestedActors = g_visibilityLastRequestedActors.load();
         out.LastVisibleActors = g_visibilityLastVisibleActors.load();

@@ -224,6 +224,8 @@ namespace DiagnosticsService
             << " exposedPoint=" << YesNo(a.UsedExposedPoint) << "\n";
         out << "Exposure cache: actors=" << visibility.CachedActors
             << " visible=" << visibility.VisibleActors
+            << " actorStateKnown=" << visibility.ActorStateKnown
+            << " destroyed=" << visibility.DestroyedActors
             << " queued=" << visibility.QueuedActors
             << " taskPending=" << YesNo(visibility.TaskPending)
             << " lastBatch=" << visibility.LastRequestedActors

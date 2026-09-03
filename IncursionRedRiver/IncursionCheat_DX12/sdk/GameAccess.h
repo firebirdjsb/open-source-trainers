@@ -58,6 +58,8 @@ namespace GameAccess
     {
         int32_t CachedActors = 0;
         int32_t VisibleActors = 0;
+        int32_t ActorStateKnown = 0;
+        int32_t DestroyedActors = 0;
         int32_t QueuedActors = 0;
         int32_t LastRequestedActors = 0;
         int32_t LastVisibleActors = 0;

@@ -560,7 +560,7 @@ namespace Aimbot
         if (bSmoothAim)
             ImGui::SliderFloat("Smooth Amount", &smoothAmount, 1.0f, 25.0f, "%.1f");
 
-        ImGui::Checkbox("Use Mouse Input Aim", &bUseMouseInput);
+        ImGui::Checkbox("Use Mouse Input Fallback", &bUseMouseInput);
         if (bUseMouseInput)
             ImGui::SliderFloat("Aim Strength", &aimStrength, 0.10f, 2.50f, "%.2f");
 
@@ -581,7 +581,7 @@ namespace Aimbot
                 selectedBone = bone;
         }
         ImGui::TextWrapped("Hold RMB to aim, or fire with LMB when Aim while firing is enabled. Both inputs use the same FOV and exposure rules. The selected bone is preferred; if it is covered but another body anchor is exposed, that exposed anchor becomes the safe aim point.");
-        ImGui::TextWrapped("With smoothing enabled, Mouse Input Aim follows normal game input. With smoothing disabled, the exact dump-validated SetControlRotation path is used automatically so a sensitivity-dependent mouse delta cannot overshoot the target.");
+        ImGui::TextWrapped("Aim uses the dump-validated SetControlRotation function on the UE game thread for both smooth and instant modes. Mouse Input Fallback is used only when the native submission is unavailable, so raw-input filtering cannot silently prevent a lock.");
         ImGui::TextWrapped("Targets must be present in the validated local IRRTeamComponent Hostiles array; unknown/neutral IRR candidates are never selected.");
         ImGui::Text("Scan %d | hostile %d | living %d | range %d | projected %d | FOV %d",
             g_aimDiagnostics.CharactersScanned, g_aimDiagnostics.EnemyCandidates,
