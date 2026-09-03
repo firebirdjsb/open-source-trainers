@@ -230,6 +230,7 @@ namespace FunctionIndices
     constexpr int32_t Actor_EnableInput = 0x2920;
     constexpr int32_t Actor_GetActorEnableCollision = 0x2926;
     constexpr int32_t Actor_GetActorEyesViewPoint = 0x2927;
+    constexpr int32_t Actor_IsActorBeingDestroyed = 0x2957;
     constexpr int32_t Actor_SetActorEnableCollision = 0x2994;
     constexpr int32_t Controller_SetControlRotation = 0x29C4;
     constexpr int32_t Controller_SetIgnoreLookInput = 0x29C5;

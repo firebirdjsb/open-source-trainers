@@ -188,6 +188,10 @@ namespace Aimbot
             if (!GameAccess::IsEnemyCharacter(actor))
                 continue;
             ++g_aimDiagnostics.EnemyCandidates;
+            bool actorAlive = true;
+            if (GameAccess::GetCachedActorState(actor, actorAlive, 1200) &&
+                !actorAlive)
+                continue;
             if (!GameAccess::IsLivingCharacter(actor))
                 continue;
             ++g_aimDiagnostics.LivingCandidates;
@@ -514,19 +518,12 @@ namespace Aimbot
                         g_aimDiagnostics.RotationBefore);
         g_aimDiagnostics.AimAttempted = true;
 
-        if (bUseMouseInput && bSmoothAim)
-        {
-            // The old direct ControlRotation write was immediately overwritten by the game's
-            // Enhanced Input/camera update. Feed the game real relative mouse-look input instead.
-            g_aimDiagnostics.UsedMouseInput = true;
-            g_aimDiagnostics.DirectWriteSucceeded = ApplyMouseAim(
-                chosen.Screen, center, bSmoothAim ? smoothAmount : 1.0f,
-                aimStrength);
-            return;
-        }
-
-        // Direct UE rotation mode now uses the dump-confirmed SetControlRotation
-        // UFunction; a raw field write remains only as an emergency fallback.
+        // Submit the dump-confirmed SetControlRotation call on the UE window/game
+        // thread.  Present is a render-thread callback in this build; sending a
+        // Windows mouse packet alone can be ignored by Enhanced Input/raw-input
+        // games, while an inline ProcessEvent can race the camera update.  The
+        // GameAccess helper coalesces requests and applies the latest rotation on
+        // the owning thread.
         FRotator current = Memory::Read<FRotator>(controller + Offsets::AController_ControlRotation);
         const FRotator desired = LookAt(camera.Location, chosen.Target);
         const double factor = bSmoothAim ? std::clamp(1.0 / static_cast<double>(smoothAmount), 0.01, 1.0) : 1.0;
@@ -536,12 +533,21 @@ namespace Aimbot
         current.Yaw = NormalizeAngle(current.Yaw);
         current.Roll = 0.0;
         g_aimDiagnostics.UsedSetControlRotationFunction = true;
-        g_aimDiagnostics.DirectWriteSucceeded = GameAccess::InvokeFunctionRaw(
-            controller, FunctionIndices::Controller_SetControlRotation,
-            &current, sizeof(current));
-        if (!g_aimDiagnostics.DirectWriteSucceeded)
-            g_aimDiagnostics.DirectWriteSucceeded = Memory::Write(
-                controller + Offsets::AController_ControlRotation, current);
+        g_aimDiagnostics.DirectWriteSucceeded = GameAccess::SubmitControlRotation(
+            controller, current);
+        if (g_aimDiagnostics.DirectWriteSucceeded)
+            return;
+
+        // Last-resort compatibility path for builds that do not accept the
+        // reflected rotation call.  This is only used when explicitly enabled;
+        // the native game-thread path above remains the normal input method.
+        if (bUseMouseInput)
+        {
+            g_aimDiagnostics.UsedMouseInput = true;
+            g_aimDiagnostics.DirectWriteSucceeded = ApplyMouseAim(
+                chosen.Screen, center, bSmoothAim ? smoothAmount : 1.0f,
+                aimStrength);
+        }
     }
 
     void RenderTab()

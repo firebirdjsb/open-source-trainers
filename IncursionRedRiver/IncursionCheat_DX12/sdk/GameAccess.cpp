@@ -96,6 +96,13 @@ namespace
         FVector ActorLocation{};
         ULONGLONG SampledAt = 0;
         bool Visible = false;
+        // A completed trace that returned false is different from a failed
+        // ProcessEvent dispatch.  Keep failed dispatches unknown so aimbot does
+        // not permanently treat a target as occluded while the game thread is
+        // changing worlds or controllers.
+        bool Valid = false;
+        bool ActorStateKnown = false;
+        bool ActorDestroyed = false;
     };
 
     struct VisibilityWork
@@ -163,6 +170,10 @@ namespace
     int32_t g_lastFunctionIndex = -1;
     bool g_processEventValid = false;
     bool g_lastProcessEventCallSucceeded = false;
+    std::mutex g_controlRotationMutex;
+    uintptr_t g_pendingControlRotationController = 0;
+    FRotator g_pendingControlRotation{};
+    std::atomic<bool> g_controlRotationTaskPending{ false };
 
     struct RuntimeLogSnapshot
     {
@@ -1182,6 +1193,12 @@ namespace GameAccess
         g_lastFunctionIndex = -1;
         g_processEventValid = false;
         g_lastProcessEventCallSucceeded = false;
+        {
+            std::lock_guard<std::mutex> lock(g_controlRotationMutex);
+            g_pendingControlRotationController = 0;
+            g_pendingControlRotation = {};
+        }
+        g_controlRotationTaskPending.store(false);
         g_lastRuntimeLog = {};
         g_lastRuntimeLogTime = 0;
         g_hasRuntimeLog = false;
@@ -1475,14 +1492,27 @@ namespace GameAccess
                         ++invalidEntries;
                         continue;
                     }
-                    if (seenCharacters.find(actor) != seenCharacters.end())
+                    // The replicated hostile array is the authoritative target
+                    // membership.  Do not require the pointer to have appeared in
+                    // the object-array character scan first: during streaming the
+                    // level actor list and GUObjectArray are populated on different
+                    // frames, which previously made every hostile entry look
+                    // unmatched and forced the broad AI-class fallback.
+                    const bool inCurrentLevel = std::find(g_actors.begin(),
+                        g_actors.end(), actor) != g_actors.end();
+                    if (inCurrentLevel || ObjectBelongsToWorld(actor, g_diag.World))
+                    {
                         g_hostileCharacters.insert(actor);
+                        if (seenCharacters.insert(actor).second)
+                            g_characters.push_back(actor);
+                    }
                 }
             }
             g_diag.HostileArrayValid = headerValid && invalidEntries == 0 &&
                 (count == 0 || nonNullEntries > 0);
             g_diag.HostileCharacterCount = static_cast<int32_t>(
                 g_hostileCharacters.size());
+            g_diag.ActiveCharacterCount = static_cast<int32_t>(g_characters.size());
         }
 
         if (g_diag.Pawn)
@@ -1650,18 +1680,35 @@ namespace GameAccess
     {
         if (!actor || actor == GetLocalPawn() || !IsIRRCharacter(actor))
             return false;
-        if (g_hostileCharacters.find(actor) != g_hostileCharacters.end())
-            return true;
-        // AI characters are the only non-local combatants in a solo raid. This
-        // fallback also covers the short interval before TeamComponent::Hostiles
-        // has replicated, which previously left zero aimbot candidates.
-        if (g_classes.IRRAIBaseCharacter &&
-            IsObjectOfClass(actor, g_classes.IRRAIBaseCharacter))
-            return true;
-        // Do not broaden an unavailable team list to every IRRBaseCharacter: that
-        // made stale/neutral actors appear as enemies. In a raid, the validated AI
-        // class is the safe fallback until Hostiles replicates.
-        return false;
+        // A live IRR character owns a typed body component.  Preview actors and
+        // stale level entries can retain the IRR class and a root transform after
+        // removal, but do not retain this component; rejecting them here keeps the
+        // shared ESP/aim candidate set free of phantom targets.
+        if (g_classes.IRRBodyComponent)
+        {
+            const uintptr_t body = Memory::Read<uintptr_t>(actor +
+                Offsets::IRRBaseCharacter_BodyComponent);
+            if (!body || !IsObjectOfClass(body, g_classes.IRRBodyComponent))
+                return false;
+        }
+        if (g_diag.HostileArrayValid)
+        {
+            // Once the team component has a structurally valid array, membership
+            // is the only accepted enemy signal.  Treating every AI-derived class
+            // as hostile was the source of phantom boxes for preview, dormant and
+            // already-removed actors that remained in the level actor array.
+            return g_hostileCharacters.find(actor) != g_hostileCharacters.end();
+        }
+
+        // During the short pre-replication interval there is no safe hostile list.
+        // Keep the fallback narrow (actual AI subclass, current world, valid root)
+        // so ESP/aim can warm without reintroducing neutral IRR objects.
+        if (!g_classes.IRRAIBaseCharacter ||
+            !IsObjectOfClass(actor, g_classes.IRRAIBaseCharacter) ||
+            !ObjectBelongsToWorld(actor, g_diag.World))
+            return false;
+        FVector location{};
+        return GetActorLocation(actor, location) && location.IsFinite();
     }
 
     bool InvokeFunctionRaw(uintptr_t object, int32_t functionIndex,
@@ -1724,6 +1771,80 @@ namespace GameAccess
         g_diag.ProcessEventValid = g_processEventValid;
         g_diag.LastProcessEventCallSucceeded = g_lastProcessEventCallSucceeded;
         return g_lastProcessEventCallSucceeded;
+    }
+
+    bool SubmitControlRotation(uintptr_t controller, const FRotator& rotation)
+    {
+        if (!controller || !rotation.IsFinite())
+            return false;
+
+        const DWORD gameThread = GetGameWindowThreadId();
+        if (gameThread && GetCurrentThreadId() == gameThread)
+        {
+            FRotator copy = rotation;
+            return InvokeFunctionRaw(controller,
+                FunctionIndices::Controller_SetControlRotation,
+                &copy, sizeof(copy));
+        }
+        if (!gameThread)
+        {
+            // Do not call ProcessEvent from an unidentified render thread during
+            // hook startup.  The caller can use its compatibility input path and
+            // retry once the window/game thread has been captured.
+            return false;
+        }
+
+        bool startTask = false;
+        {
+            std::lock_guard<std::mutex> lock(g_controlRotationMutex);
+            g_pendingControlRotationController = controller;
+            g_pendingControlRotation = rotation;
+            if (!g_controlRotationTaskPending.load())
+            {
+                g_controlRotationTaskPending.store(true);
+                startTask = true;
+            }
+        }
+        if (!startTask)
+            return true;
+
+        if (!QueueGameThreadTask([]()
+            {
+                // Coalesce rapid render-thread updates to the newest rotation;
+                // never build an unbounded task backlog while the game is busy.
+                for (;;)
+                {
+                    uintptr_t pendingController = 0;
+                    FRotator pendingRotation{};
+                    {
+                        std::lock_guard<std::mutex> lock(g_controlRotationMutex);
+                        pendingController = g_pendingControlRotationController;
+                        pendingRotation = g_pendingControlRotation;
+                        g_pendingControlRotationController = 0;
+                    }
+                    if (!pendingController)
+                    {
+                        std::lock_guard<std::mutex> lock(g_controlRotationMutex);
+                        if (!g_pendingControlRotationController)
+                        {
+                            g_controlRotationTaskPending.store(false);
+                            return;
+                        }
+                        continue;
+                    }
+                    InvokeFunctionRaw(pendingController,
+                        FunctionIndices::Controller_SetControlRotation,
+                        &pendingRotation, sizeof(pendingRotation));
+                }
+            }, false))
+        {
+            std::lock_guard<std::mutex> lock(g_controlRotationMutex);
+            g_pendingControlRotationController = 0;
+            g_pendingControlRotation = {};
+            g_controlRotationTaskPending.store(false);
+            return false;
+        }
+        return true;
     }
 
     bool InvokeBooleanFunction(uintptr_t object, int32_t functionIndex, bool value)
@@ -2122,13 +2243,34 @@ namespace GameAccess
                 g_visibilityQueue.clear();
                 g_visibilityCacheWorld = world;
             }
+            // Aim activation uses a short interval and must not wait behind the
+            // ESP's broad queue.  Promote those actors to the front so the next
+            // game-thread batch samples the exact target under the crosshair.
+            const bool urgent = minimumIntervalMs <= 75u;
             for (const VisibilityWork& work : prepared)
             {
                 const auto queued = std::find_if(g_visibilityQueue.begin(),
                     g_visibilityQueue.end(), [&](const VisibilityWork& item)
                     { return item.Actor == work.Actor; });
                 if (queued != g_visibilityQueue.end())
-                    *queued = work;
+                {
+                    if (urgent)
+                    {
+                        // Erase/reinsert instead of retaining the old queue
+                        // position; this also refreshes the observer and body
+                        // points used by the pending sample.
+                        g_visibilityQueue.erase(queued);
+                        g_visibilityQueue.insert(g_visibilityQueue.begin(), work);
+                    }
+                    else
+                        *queued = work;
+                }
+                else if (urgent)
+                {
+                    g_visibilityQueue.insert(g_visibilityQueue.begin(), work);
+                    if (g_visibilityQueue.size() > 128)
+                        g_visibilityQueue.pop_back();
+                }
                 else if (g_visibilityQueue.size() < 128)
                     g_visibilityQueue.push_back(work);
             }
@@ -2159,6 +2301,12 @@ namespace GameAccess
         if (!QueueGameThreadTask([requested = std::move(requested), world,
                                   library, controller]()
             {
+                struct ProbeResult
+                {
+                    bool Invoked = false;
+                    bool Hit = false;
+                };
+
                 // Controller::LineOfSightTo is the engine's authoritative trace and
                 // remains reliable when the Blueprint sphere helper has not warmed
                 // its camera/context state yet.  Keep the Blueprint sampler as the
@@ -2183,28 +2331,37 @@ namespace GameAccess
                                                   const FVector& viewpoint)
                 {
                     if (!controller || !actor)
-                        return false;
+                        return ProbeResult{};
                     auto invoke = [&](const FVector& point)
                     {
                         alignas(16) std::array<uint8_t, 0x28> params{};
                         std::memcpy(params.data() + 0x00, &actor, sizeof(actor));
                         std::memcpy(params.data() + 0x08, &point, sizeof(point));
                         params[0x20] = 0; // bAlternateChecks
-                        return InvokeFunctionRaw(controller,
+                        const bool invoked = InvokeFunctionRaw(controller,
                             FunctionIndices::Controller_LineOfSightTo,
-                            params.data(), params.size()) && params[0x21] != 0;
+                            params.data(), params.size());
+                        return ProbeResult{ invoked, invoked && params[0x21] != 0 };
                     };
 
                     // UE's documented/native convention is a zero ViewPoint:
                     // LineOfSightTo then asks the controller for its current eye
                     // location. Passing a cached render-camera position here can
                     // be one frame stale and made every open target look hidden.
-                    if (invoke(FVector{}))
-                        return true;
+                    const ProbeResult nativeDefault = invoke(FVector{});
+                    if (nativeDefault.Hit)
+                        return nativeDefault;
                     // Keep the current engine viewpoint as a secondary probe for
                     // custom controller implementations that do not honor zero.
-                    return viewpoint.IsFinite() && viewpoint.Length() > 1.0 &&
-                        invoke(viewpoint);
+                    if (viewpoint.IsFinite() && viewpoint.Length() > 1.0)
+                    {
+                        const ProbeResult nativeExplicit = invoke(viewpoint);
+                        return ProbeResult{
+                            nativeDefault.Invoked || nativeExplicit.Invoked,
+                            nativeExplicit.Hit
+                        };
+                    }
+                    return nativeDefault;
                 };
 
                 auto checkSphere = [&](const FVector& observer,
@@ -2217,9 +2374,10 @@ namespace GameAccess
                     std::memcpy(params.data() + 0x20, &center, sizeof(center));
                     std::memcpy(params.data() + 0x38, &radius, sizeof(radius));
                     std::memcpy(params.data() + 0x3C, &rays, sizeof(rays));
-                    return InvokeFunctionRaw(library,
+                    const bool invoked = InvokeFunctionRaw(library,
                         FunctionIndices::GeneralFunctionLibrary_CheckSphereVisibility,
-                        params.data(), params.size()) && params[0x40] != 0;
+                        params.data(), params.size());
+                    return ProbeResult{ invoked, invoked && params[0x40] != 0 };
                 };
 
                 std::vector<std::pair<uintptr_t, VisibilityCacheEntry>> completed;
@@ -2229,7 +2387,27 @@ namespace GameAccess
                 {
                     VisibilityCacheEntry result{};
                     result.ActorLocation = work.ActorLocation;
-                    result.SampledAt = GetTickCount64();
+                    bool actorStateSucceeded = false;
+                    if (GetWorld() == world)
+                    {
+                        alignas(8) std::array<uint8_t, 8> actorStateParams{};
+                        actorStateSucceeded = InvokeFunctionRaw(work.Actor,
+                            FunctionIndices::Actor_IsActorBeingDestroyed,
+                            actorStateParams.data(), actorStateParams.size());
+                        result.ActorStateKnown = actorStateSucceeded;
+                        result.ActorDestroyed = actorStateSucceeded &&
+                            actorStateParams[0] != 0;
+                    }
+                    // A destroyed actor can remain in ULevel::Actors until the
+                    // next GC pass.  Publish its state to the shared cache, but do
+                    // not spend LOS work or render it as a target.
+                    if (result.ActorStateKnown && result.ActorDestroyed)
+                    {
+                        result.Valid = true;
+                        result.SampledAt = GetTickCount64();
+                        completed.emplace_back(work.Actor, result);
+                        continue;
+                    }
                     const FVector observer = haveEngineViewPoint ?
                         engineViewPoint : work.ObserverLocation;
 
@@ -2238,18 +2416,29 @@ namespace GameAccess
                     // is still waiting for its Blueprint camera context. Once the
                     // actor is known visible, retain the selected body point and use
                     // sphere samples only to find a more exposed limb/anchor.
-                    const bool actorVisible = GetWorld() == world &&
-                        controllerLineOfSight(work.Actor, observer);
-                    const bool broadVisible = !actorVisible && GetWorld() == world &&
-                        checkSphere(observer, work.ActorLocation,
-                                    work.BroadRadius, 9);
+                    ProbeResult actorProbe{};
+                    if (GetWorld() == world)
+                        actorProbe = controllerLineOfSight(work.Actor, observer);
+                    const bool actorVisible = actorProbe.Hit;
+                    ProbeResult broadProbe{};
+                    if (!actorVisible && GetWorld() == world)
+                        broadProbe = checkSphere(observer, work.ActorLocation,
+                                                 work.BroadRadius, 9);
+                    const bool broadVisible = broadProbe.Hit;
+                    bool querySucceeded = actorStateSucceeded ||
+                        actorProbe.Invoked || broadProbe.Invoked;
                     if (actorVisible || broadVisible)
                     {
                         for (uint8_t index = 0; index < work.PointCount; ++index)
                         {
-                            if (!actorVisible && !checkSphere(observer,
-                                             work.Points[index], 14.0f, 3))
-                                continue;
+                            if (!actorVisible)
+                            {
+                                const ProbeResult pointProbe = checkSphere(observer,
+                                    work.Points[index], 14.0f, 3);
+                                querySucceeded = querySucceeded || pointProbe.Invoked;
+                                if (!pointProbe.Hit)
+                                    continue;
+                            }
                             result.Visible = true;
                             result.ExposedPoint = work.Points[index];
                             ++visibleCount;
@@ -2265,7 +2454,21 @@ namespace GameAccess
                             result.ExposedPoint = work.Points[0];
                             ++visibleCount;
                         }
+                        // The broad sampler can report a genuinely exposed part
+                        // even when a tiny pose anchor is one frame stale.  Keep the
+                        // actor visible (and let the selected point remain the aim
+                        // point) instead of converting a successful visibility probe
+                        // into a false hidden result.
+                        if (broadVisible && !result.Visible && work.PointCount)
+                        {
+                            result.Visible = true;
+                            result.ExposedPoint = work.Points[0];
+                            ++visibleCount;
+                        }
                     }
+                    result.Valid = querySucceeded;
+                    if (result.Valid)
+                        result.SampledAt = GetTickCount64();
                     completed.emplace_back(work.Actor, result);
                 }
 
@@ -2315,7 +2518,8 @@ namespace GameAccess
             if (g_visibilityCacheWorld != GetWorld())
                 return false;
             const auto found = g_visibilityCache.find(actor);
-            if (found == g_visibilityCache.end() || !found->second.SampledAt ||
+            if (found == g_visibilityCache.end() || !found->second.Valid ||
+                !found->second.SampledAt ||
                 GetTickCount64() - found->second.SampledAt > maximumAgeMs)
                 return false;
             cached = found->second;
@@ -2329,6 +2533,29 @@ namespace GameAccess
                 currentLocation - cached.ActorLocation : FVector{};
             *outExposedPoint = cached.ExposedPoint + delta;
         }
+        return true;
+    }
+
+    bool GetCachedActorState(uintptr_t actor, bool& outAlive,
+                             uint32_t maximumAgeMs)
+    {
+        outAlive = false;
+        if (!actor)
+            return false;
+
+        VisibilityCacheEntry cached{};
+        {
+            std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
+            if (g_visibilityCacheWorld != GetWorld())
+                return false;
+            const auto found = g_visibilityCache.find(actor);
+            if (found == g_visibilityCache.end() || !found->second.Valid ||
+                !found->second.ActorStateKnown || !found->second.SampledAt ||
+                GetTickCount64() - found->second.SampledAt > maximumAgeMs)
+                return false;
+            cached = found->second;
+        }
+        outAlive = !cached.ActorDestroyed;
         return true;
     }
 

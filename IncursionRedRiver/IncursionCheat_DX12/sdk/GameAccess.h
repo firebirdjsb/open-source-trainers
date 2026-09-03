@@ -189,6 +189,12 @@ namespace GameAccess
     Camera GetRenderCamera();
     bool InvokeFunctionRaw(uintptr_t object, int32_t functionIndex,
                            void* params, size_t paramSize);
+    // Submit controller rotation on the UE window/game thread.  Present runs on
+    // the render thread in this build, so invoking SetControlRotation inline can
+    // be ignored by Enhanced Input (or race the camera update).  The helper
+    // coalesces pending requests to one latest rotation and keeps the render path
+    // non-blocking.
+    bool SubmitControlRotation(uintptr_t controller, const FRotator& rotation);
     bool InvokeBooleanFunction(uintptr_t object, int32_t functionIndex, bool value);
     bool QueryBooleanFunction(uintptr_t object, int32_t functionIndex,
                               bool& outValue);
@@ -221,6 +227,11 @@ namespace GameAccess
     bool GetCachedVisibility(uintptr_t actor, bool& outVisible,
                              FVector* outExposedPoint = nullptr,
                              uint32_t maximumAgeMs = 750);
+    // Returns the native AActor::IsActorBeingDestroyed state when the shared
+    // game-thread sample has completed.  A missing sample is reported as unknown
+    // so target acquisition can warm without trusting a stale bitfield.
+    bool GetCachedActorState(uintptr_t actor, bool& outAlive,
+                             uint32_t maximumAgeMs = 1000);
     bool GetActorVelocity(uintptr_t actor, FVector& outVelocity);
     bool PredictBallisticAim(const FVector& start, const FVector& target,
                              const FVector& targetVelocity, float maxTime,

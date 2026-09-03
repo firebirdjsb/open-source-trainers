@@ -161,6 +161,10 @@ namespace ESP
             // when the transient team list is unavailable.
             if (!confirmedHostile)
                 continue;
+            bool actorAlive = true;
+            if (GameAccess::GetCachedActorState(actor, actorAlive, 1200) &&
+                !actorAlive)
+                continue;
 
             FVector location{};
             if (!GameAccess::GetActorLocation(actor, location))
