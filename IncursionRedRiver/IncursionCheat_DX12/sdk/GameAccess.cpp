@@ -115,6 +115,7 @@ namespace
         float BroadRadius = 75.0f;
         bool ActorStateKnown = false;
         bool ActorDestroyed = false;
+        bool Urgent = false;
     };
 
     GameAccess::RuntimeDiagnostics g_diag{};
@@ -180,6 +181,11 @@ namespace
     uintptr_t g_pendingControlRotationController = 0;
     FRotator g_pendingControlRotation{};
     std::atomic<bool> g_controlRotationTaskPending{ false };
+    std::mutex g_lookInputMutex;
+    uintptr_t g_pendingLookInputController = 0;
+    double g_pendingLookPitchDegrees = 0.0;
+    double g_pendingLookYawDegrees = 0.0;
+    std::atomic<bool> g_lookInputTaskPending{ false };
 
     struct RuntimeLogSnapshot
     {
@@ -1209,6 +1215,13 @@ namespace GameAccess
             g_pendingControlRotation = {};
         }
         g_controlRotationTaskPending.store(false);
+        {
+            std::lock_guard<std::mutex> lock(g_lookInputMutex);
+            g_pendingLookInputController = 0;
+            g_pendingLookPitchDegrees = 0.0;
+            g_pendingLookYawDegrees = 0.0;
+        }
+        g_lookInputTaskPending.store(false);
         g_lastRuntimeLog = {};
         g_lastRuntimeLogTime = 0;
         g_hasRuntimeLog = false;
@@ -1701,7 +1714,14 @@ namespace GameAccess
 
     bool IsEnemyCharacter(uintptr_t actor)
     {
-        if (!actor || actor == GetLocalPawn() || !IsIRRCharacter(actor))
+        if (!actor || actor == GetLocalPawn())
+            return false;
+        // Refresh validates every member against IRRBaseCharacter before
+        // publishing the hostile set. Avoid repeating class-chain and typed body
+        // checks for every actor on every render frame.
+        if (g_diag.HostileArrayValid)
+            return g_hostileCharacters.find(actor) != g_hostileCharacters.end();
+        if (!IsIRRCharacter(actor))
             return false;
         // A live IRR character owns a typed body component.  Preview actors and
         // stale level entries can retain the IRR class and a root transform after
@@ -1714,15 +1734,6 @@ namespace GameAccess
             if (!body || !IsObjectOfClass(body, g_classes.IRRBodyComponent))
                 return false;
         }
-        if (g_diag.HostileArrayValid)
-        {
-            // Once the team component has a structurally valid array, membership
-            // is the only accepted enemy signal.  Treating every AI-derived class
-            // as hostile was the source of phantom boxes for preview, dormant and
-            // already-removed actors that remained in the level actor array.
-            return g_hostileCharacters.find(actor) != g_hostileCharacters.end();
-        }
-
         // During the short pre-replication interval there is no safe hostile list.
         // Keep the fallback narrow (actual AI subclass, current world, valid root)
         // so ESP/aim can warm without reintroducing neutral IRR objects.
@@ -1865,6 +1876,101 @@ namespace GameAccess
             g_pendingControlRotationController = 0;
             g_pendingControlRotation = {};
             g_controlRotationTaskPending.store(false);
+            return false;
+        }
+        return true;
+    }
+
+    bool SubmitLookInput(uintptr_t controller, double pitchDeltaDegrees,
+                         double yawDeltaDegrees)
+    {
+        if (!controller || !std::isfinite(pitchDeltaDegrees) ||
+            !std::isfinite(yawDeltaDegrees))
+            return false;
+
+        auto apply = [](uintptr_t pendingController, double pitchDegrees,
+                        double yawDegrees)
+        {
+            float pitchScale = Memory::Read<float>(pendingController +
+                Offsets::APlayerController_InputPitchScale);
+            float yawScale = Memory::Read<float>(pendingController +
+                Offsets::APlayerController_InputYawScale);
+            if (!std::isfinite(pitchScale) || std::abs(pitchScale) < 0.001f ||
+                std::abs(pitchScale) > 100.0f)
+                pitchScale = 1.0f;
+            if (!std::isfinite(yawScale) || std::abs(yawScale) < 0.001f ||
+                std::abs(yawScale) > 100.0f)
+                yawScale = 1.0f;
+
+            float pitchInput = static_cast<float>(pitchDegrees /
+                static_cast<double>(pitchScale));
+            float yawInput = static_cast<float>(yawDegrees /
+                static_cast<double>(yawScale));
+            const bool pitchOk = std::abs(pitchInput) < 0.0001f ||
+                InvokeFunctionRaw(pendingController,
+                    FunctionIndices::PlayerController_AddPitchInput,
+                    &pitchInput, sizeof(pitchInput));
+            const bool yawOk = std::abs(yawInput) < 0.0001f ||
+                InvokeFunctionRaw(pendingController,
+                    FunctionIndices::PlayerController_AddYawInput,
+                    &yawInput, sizeof(yawInput));
+            return pitchOk && yawOk;
+        };
+
+        const DWORD gameThread = GetGameWindowThreadId();
+        if (!gameThread)
+            return false;
+        if (GetCurrentThreadId() == gameThread)
+            return apply(controller, pitchDeltaDegrees, yawDeltaDegrees);
+
+        bool startTask = false;
+        {
+            std::lock_guard<std::mutex> lock(g_lookInputMutex);
+            g_pendingLookInputController = controller;
+            g_pendingLookPitchDegrees = pitchDeltaDegrees;
+            g_pendingLookYawDegrees = yawDeltaDegrees;
+            if (!g_lookInputTaskPending.load())
+            {
+                g_lookInputTaskPending.store(true);
+                startTask = true;
+            }
+        }
+        if (!startTask)
+            return true;
+
+        if (!QueueGameThreadTask([apply]()
+            {
+                for (;;)
+                {
+                    uintptr_t pendingController = 0;
+                    double pitchDegrees = 0.0;
+                    double yawDegrees = 0.0;
+                    {
+                        std::lock_guard<std::mutex> lock(g_lookInputMutex);
+                        pendingController = g_pendingLookInputController;
+                        pitchDegrees = g_pendingLookPitchDegrees;
+                        yawDegrees = g_pendingLookYawDegrees;
+                        g_pendingLookInputController = 0;
+                    }
+                    if (!pendingController)
+                    {
+                        std::lock_guard<std::mutex> lock(g_lookInputMutex);
+                        if (!g_pendingLookInputController)
+                        {
+                            g_lookInputTaskPending.store(false);
+                            return;
+                        }
+                        continue;
+                    }
+                    apply(pendingController, pitchDegrees, yawDegrees);
+                }
+            }, false))
+        {
+            std::lock_guard<std::mutex> lock(g_lookInputMutex);
+            g_pendingLookInputController = 0;
+            g_pendingLookPitchDegrees = 0.0;
+            g_pendingLookYawDegrees = 0.0;
+            g_lookInputTaskPending.store(false);
             return false;
         }
         return true;
@@ -2187,6 +2293,8 @@ namespace GameAccess
                                   const std::string& preferredTarget,
                                   uint32_t minimumIntervalMs)
     {
+        const ULONGLONG now = GetTickCount64();
+        const bool urgent = minimumIntervalMs <= 75u;
         const uintptr_t world = GetWorld();
         const uintptr_t library = GetObjectByIndex(
             ObjectIndices::DefaultGeneralFunctionLibrary);
@@ -2198,10 +2306,6 @@ namespace GameAccess
         if (actors.empty() || !world || !library || !camera.Valid ||
             !GetGameWindowThreadId())
             return false;
-
-        // Warm the pose cache independently. Visibility work consumes immutable
-        // points only; all reflected ray tests are posted to the game thread below.
-        RequestPoseSamples(actors, std::max<uint32_t>(minimumIntervalMs, 75));
 
         static constexpr std::array<const char*, 10> BodyTargets = {
             "head", "neck", "chest", "stomach", "arm_l", "arm_r",
@@ -2218,8 +2322,30 @@ namespace GameAccess
             VisibilityWork work{};
             work.Actor = actor;
             work.ObserverLocation = camera.Location;
+            work.Urgent = urgent;
             if (!GetActorLocation(actor, work.ActorLocation))
                 continue;
+
+            // Do not rebuild and resubmit points every Present. Visible targets
+            // need a quicker refresh than hidden ones, while the crosshair
+            // shortlist gets the tightest budget. Material actor movement still
+            // invalidates the cached result immediately.
+            bool recentlySampled = false;
+            {
+                std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
+                const auto cached = g_visibilityCache.find(actor);
+                if (cached != g_visibilityCache.end() && cached->second.Valid &&
+                    cached->second.SampledAt)
+                {
+                    const ULONGLONG freshness = urgent ? 45u :
+                        (cached->second.Visible ? 180u : 400u);
+                    recentlySampled = now - cached->second.SampledAt < freshness &&
+                        cached->second.ActorLocation.Distance(work.ActorLocation) < 75.0;
+                }
+            }
+            if (recentlySampled)
+                continue;
+
             const Health health = GetHealth(actor);
             if (health.Valid)
             {
@@ -2247,26 +2373,68 @@ namespace GameAccess
                     addPoint(point);
             };
 
-            // The selected bone is tested first. If it is covered, the remaining
-            // live anchors allow an exposed head, torso, arm, leg, or foot to win.
+            // The selected bone is tested first. Active aim gets additional live
+            // points; passive ESP needs only a representative head/torso sample.
             addTarget(preferredTarget);
-            for (const char* target : BodyTargets)
-                if (preferredTarget != target)
-                    addTarget(target);
+            if (urgent)
+            {
+                for (const char* target : BodyTargets)
+                    if (preferredTarget != target)
+                        addTarget(target);
+            }
+            else
+            {
+                if (preferredTarget != "head")
+                    addTarget("head");
+                if (preferredTarget != "chest")
+                    addTarget("chest");
+            }
 
             if (!work.PointCount)
             {
                 const double halfHeight = static_cast<double>(
                     GetCapsuleHalfHeight(actor));
-                for (const double factor : { 0.78, 0.58, 0.32, -0.10, -0.48, -0.78 })
+                auto targetFactor = [](const std::string& name)
+                {
+                    if (name == "head") return 0.78;
+                    if (name == "neck") return 0.58;
+                    if (name == "chest") return 0.32;
+                    if (name == "stomach" || name == "pelvis") return -0.10;
+                    if (name == "leg_l" || name == "leg_r") return -0.48;
+                    if (name == "foot_l" || name == "foot_r") return -0.78;
+                    return 0.18;
+                };
+                addPoint(work.ActorLocation + FVector(0.0, 0.0,
+                    halfHeight * targetFactor(preferredTarget)));
+                for (const double factor : { 0.78, 0.32, -0.10, -0.48 })
                     addPoint(work.ActorLocation + FVector(0.0, 0.0,
                         halfHeight * factor));
+
+                // Two camera-relative shoulder anchors let an exposed side of a
+                // partially covered actor pass without requiring skeleton data.
+                const double dx = work.ActorLocation.X - camera.Location.X;
+                const double dy = work.ActorLocation.Y - camera.Location.Y;
+                const double horizontal = std::hypot(dx, dy);
+                if (horizontal > 1.0)
+                {
+                    const double radius = static_cast<double>(
+                        GetCapsuleRadius(actor)) * 0.72;
+                    const FVector right(-dy / horizontal, dx / horizontal, 0.0);
+                    const FVector torso = work.ActorLocation + FVector(
+                        0.0, 0.0, halfHeight * 0.30);
+                    addPoint(torso + right * radius);
+                    addPoint(torso - right * radius);
+                }
             }
             if (work.PointCount)
                 prepared.push_back(work);
         }
         if (prepared.empty())
-            return false;
+        {
+            std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
+            if (g_visibilityCacheWorld != world || g_visibilityQueue.empty())
+                return false;
+        }
 
         {
             std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
@@ -2276,11 +2444,10 @@ namespace GameAccess
                 g_visibilityQueue.clear();
                 g_visibilityCacheWorld = world;
             }
-            // Aim activation uses a short interval and must not wait behind the
-            // ESP's broad queue.  Promote those actors to the front so the next
-            // game-thread batch samples the exact target under the crosshair.
-            const bool urgent = minimumIntervalMs <= 75u;
-            for (const VisibilityWork& work : prepared)
+            // Aim activation must not wait behind the ESP queue. Reverse iteration
+            // preserves the caller's closest-to-crosshair ordering when inserting
+            // at the front (the old loop accidentally reversed this priority).
+            auto queueWork = [&](const VisibilityWork& work)
             {
                 const auto queued = std::find_if(g_visibilityQueue.begin(),
                     g_visibilityQueue.end(), [&](const VisibilityWork& item)
@@ -2289,27 +2456,36 @@ namespace GameAccess
                 {
                     if (urgent)
                     {
-                        // Erase/reinsert instead of retaining the old queue
-                        // position; this also refreshes the observer and body
-                        // points used by the pending sample.
                         g_visibilityQueue.erase(queued);
                         g_visibilityQueue.insert(g_visibilityQueue.begin(), work);
                     }
                     else
-                        *queued = work;
+                    {
+                        // Do not let the later passive ESP request overwrite an
+                        // already-promoted aimbot request's selected-bone ordering.
+                        if (!queued->Urgent)
+                            *queued = work;
+                    }
                 }
                 else if (urgent)
                 {
                     g_visibilityQueue.insert(g_visibilityQueue.begin(), work);
-                    if (g_visibilityQueue.size() > 128)
+                    if (g_visibilityQueue.size() > 64)
                         g_visibilityQueue.pop_back();
                 }
-                else if (g_visibilityQueue.size() < 128)
+                else if (g_visibilityQueue.size() < 64)
                     g_visibilityQueue.push_back(work);
+            };
+            if (urgent)
+            {
+                for (auto it = prepared.rbegin(); it != prepared.rend(); ++it)
+                    queueWork(*it);
             }
+            else
+                for (const VisibilityWork& work : prepared)
+                    queueWork(work);
         }
 
-        const ULONGLONG now = GetTickCount64();
         if (g_visibilityTaskPending.load() ||
             (g_lastVisibilityRequestAt &&
              now - g_lastVisibilityRequestAt < minimumIntervalMs))
@@ -2318,7 +2494,11 @@ namespace GameAccess
         std::vector<VisibilityWork> requested;
         {
             std::lock_guard<std::mutex> lock(g_visibilityCacheMutex);
-            const size_t count = std::min<size_t>(g_visibilityQueue.size(), 16);
+            // An urgent shortlist remains first, but the six-item batch leaves
+            // room for queued passive ESP actors. Passive-only batches use eight.
+            const size_t budget = !g_visibilityQueue.empty() &&
+                g_visibilityQueue.front().Urgent ? 6u : 8u;
+            const size_t count = std::min<size_t>(g_visibilityQueue.size(), budget);
             requested.assign(g_visibilityQueue.begin(),
                              g_visibilityQueue.begin() + count);
             g_visibilityQueue.erase(g_visibilityQueue.begin(),
@@ -2485,11 +2665,12 @@ namespace GameAccess
                     const FVector observer = haveEngineViewPoint ?
                         engineViewPoint : work.ObserverLocation;
 
-                    // Trace the preferred point followed by representative live
-                    // anchors. Six traces cover head/neck/torso/arms without turning
-                    // a crowded raid into hundreds of per-frame ProcessEvent calls.
+                    // Active aim may test four anchors. Passive ESP tests three;
+                    // hidden actors can no longer consume six reflected traces each.
                     bool exactTraceInvoked = false;
-                    const uint8_t traceCount = std::min<uint8_t>(work.PointCount, 6);
+                    const uint8_t traceBudget = work.Urgent ? 4u : 3u;
+                    const uint8_t traceCount = std::min<uint8_t>(
+                        work.PointCount, traceBudget);
                     for (uint8_t index = 0; index < traceCount &&
                          GetWorld() == world; ++index)
                     {

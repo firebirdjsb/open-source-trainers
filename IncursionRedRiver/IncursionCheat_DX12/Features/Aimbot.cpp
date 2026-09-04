@@ -188,10 +188,6 @@ namespace Aimbot
             if (!GameAccess::IsEnemyCharacter(actor))
                 continue;
             ++g_aimDiagnostics.EnemyCandidates;
-            bool actorAlive = true;
-            if (GameAccess::GetCachedActorState(actor, actorAlive, 1200) &&
-                !actorAlive)
-                continue;
             const auto health = GameAccess::GetHealth(actor);
             if (!health.Valid || health.Dead || health.Current <= health.Minimum)
                 continue;
@@ -264,7 +260,7 @@ namespace Aimbot
         // while bounding ProcessEvent work so large AI groups do not reduce FPS.
         if (g_aimDiagnostics.ActivationHeld)
         {
-            constexpr size_t MaxPoseQueries = 8;
+            constexpr size_t MaxPoseQueries = 4;
             if (candidates.size() > MaxPoseQueries)
             {
                 // Do not evict the current sticky target merely because its coarse
@@ -313,6 +309,9 @@ namespace Aimbot
                 candidate.BodyComponent = bodyComponent;
                 ++g_aimDiagnostics.PoseAwareTargets;
             }
+            std::sort(candidates.begin(), candidates.end(),
+                [](const AimCandidate& left, const AimCandidate& right)
+                { return left.ScreenDistance < right.ScreenDistance; });
         }
 
         // Visibility is one shared, game-thread sampled result. The selected point
@@ -325,7 +324,7 @@ namespace Aimbot
         // broader on-screen visibility queue; limiting this request prevents an
         // enabled-but-idle aimbot from continuously replacing that queue and keeps
         // ADS/fire acquisition under a small, predictable budget.
-        const size_t visibilityLimit = g_aimDiagnostics.ActivationHeld ? 8u : 16u;
+        const size_t visibilityLimit = g_aimDiagnostics.ActivationHeld ? 4u : 6u;
         visibilityActors.reserve(std::min(candidates.size(), visibilityLimit));
         for (size_t index = 0; index < candidates.size() &&
              index < visibilityLimit; ++index)
@@ -334,7 +333,7 @@ namespace Aimbot
             visibilityActors.push_back(candidate.Actor);
         }
         GameAccess::RequestVisibilitySamples(visibilityActors, selectedBone,
-            g_aimDiagnostics.ActivationHeld ? 65u : 140u);
+            g_aimDiagnostics.ActivationHeld ? 50u : 200u);
 
         for (AimCandidate& candidate : candidates)
         {
@@ -519,17 +518,24 @@ namespace Aimbot
                         g_aimDiagnostics.RotationBefore);
         g_aimDiagnostics.AimAttempted = true;
 
-        // Submit the dump-confirmed SetControlRotation call on the UE window/game
-        // thread.  Present is a render-thread callback in this build; sending a
-        // Windows mouse packet alone can be ignored by Enhanced Input/raw-input
-        // games, while an inline ProcessEvent can race the camera update.  The
-        // GameAccess helper coalesces requests and applies the latest rotation on
-        // the owning thread.
+        // Feed the angular error through the dump-confirmed PlayerController look
+        // functions on the UE window/game thread. This is the same accumulator the
+        // game's normal camera input consumes, so Enhanced Input cannot overwrite
+        // the lock on its next update. Requests are coalesced to one latest delta.
         FRotator current = Memory::Read<FRotator>(controller + Offsets::AController_ControlRotation);
         const FRotator desired = LookAt(camera.Location, chosen.Target);
         const double factor = bSmoothAim ? std::clamp(1.0 / static_cast<double>(smoothAmount), 0.01, 1.0) : 1.0;
-        current.Pitch += NormalizeAngle(desired.Pitch - current.Pitch) * factor;
-        current.Yaw += NormalizeAngle(desired.Yaw - current.Yaw) * factor;
+        const double pitchDelta = NormalizeAngle(desired.Pitch - current.Pitch) * factor;
+        const double yawDelta = NormalizeAngle(desired.Yaw - current.Yaw) * factor;
+        g_aimDiagnostics.UsedControllerLookInput = true;
+        g_aimDiagnostics.DirectWriteSucceeded = GameAccess::SubmitLookInput(
+            controller, pitchDelta, yawDelta);
+        if (g_aimDiagnostics.DirectWriteSucceeded)
+            return;
+
+        // Compatibility fallback for controllers that disable AddPitch/YawInput.
+        current.Pitch += pitchDelta;
+        current.Yaw += yawDelta;
         current.Pitch = std::clamp(current.Pitch, -89.0, 89.0);
         current.Yaw = NormalizeAngle(current.Yaw);
         current.Roll = 0.0;
@@ -582,7 +588,7 @@ namespace Aimbot
                 selectedBone = bone;
         }
         ImGui::TextWrapped("Hold RMB to aim, or fire with LMB when Aim while firing is enabled. Both inputs use the same FOV and exposure rules. The selected bone is preferred; if it is covered but another body anchor is exposed, that exposed anchor becomes the safe aim point.");
-        ImGui::TextWrapped("Aim uses the dump-validated SetControlRotation function on the UE game thread for both smooth and instant modes. Mouse Input Fallback is used only when the native submission is unavailable, so raw-input filtering cannot silently prevent a lock.");
+        ImGui::TextWrapped("Aim uses dump-validated PlayerController AddPitchInput/AddYawInput on the UE game thread, following the game's normal look accumulator every frame. SetControlRotation and mouse input remain bounded compatibility fallbacks.");
         ImGui::TextWrapped("Targets must be present in the validated local IRRTeamComponent Hostiles array; unknown/neutral IRR candidates are never selected.");
         ImGui::Text("Scan %d | hostile %d | living %d | range %d | projected %d | FOV %d",
             g_aimDiagnostics.CharactersScanned, g_aimDiagnostics.EnemyCandidates,

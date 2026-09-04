@@ -39,6 +39,8 @@ EXPECTED = [
     ("Class Engine.PlayerController", "Player", 0x348),
     ("Class Engine.PlayerController", "AcknowledgedPawn", 0x350),
     ("Class Engine.PlayerController", "PlayerCameraManager", 0x360),
+    ("Class Engine.PlayerController", "InputYawScale", 0x540),
+    ("Class Engine.PlayerController", "InputPitchScale", 0x544),
     ("Class Engine.PlayerController", "bIsLocalPlayerController", 0x6C4),
     ("Class Engine.Actor", "CustomTimeDilation", 0x68),
     ("Class Engine.Actor", "Owner", 0x158),

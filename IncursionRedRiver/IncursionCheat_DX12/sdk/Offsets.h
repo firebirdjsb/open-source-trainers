@@ -51,6 +51,8 @@ namespace Offsets
     constexpr uintptr_t APlayerController_Player              = 0x348;
     constexpr uintptr_t APlayerController_AcknowledgedPawn    = 0x350;
     constexpr uintptr_t APlayerController_PlayerCameraManager = 0x360;
+    constexpr uintptr_t APlayerController_InputYawScale       = 0x540;
+    constexpr uintptr_t APlayerController_InputPitchScale     = 0x544;
     constexpr uintptr_t APlayerController_bIsLocalController  = 0x6C4;
 
     constexpr uintptr_t AActor_CustomTimeDilation = 0x68;
@@ -238,6 +240,8 @@ namespace FunctionIndices
     constexpr int32_t Controller_SetIgnoreLookInput = 0x29C5;
     constexpr int32_t Controller_SetIgnoreMoveInput = 0x29C6;
     constexpr int32_t Controller_StopMovement = 0x29C8;
+    constexpr int32_t PlayerController_AddPitchInput = 0x29CB;
+    constexpr int32_t PlayerController_AddYawInput = 0x29CD;
     constexpr int32_t EBBarrel_CalculateAimDirectionFromLocation = 0x2B75;
     constexpr int32_t PlayerController_ProjectWorldLocationToScreen = 0x2A36;
     constexpr int32_t WeaponComponent_GetDurabilityPercentage = 0x2B6F;

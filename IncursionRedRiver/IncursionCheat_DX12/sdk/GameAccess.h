@@ -201,6 +201,12 @@ namespace GameAccess
     // coalesces pending requests to one latest rotation and keeps the render path
     // non-blocking.
     bool SubmitControlRotation(uintptr_t controller, const FRotator& rotation);
+    // Feed angular deltas through PlayerController::AddPitchInput/AddYawInput on
+    // the UE window/game thread. This follows the same path as normal player look
+    // input, so Enhanced Input cannot overwrite a one-off control-rotation write.
+    // Requests are coalesced to the newest render-frame delta.
+    bool SubmitLookInput(uintptr_t controller, double pitchDeltaDegrees,
+                         double yawDeltaDegrees);
     bool InvokeBooleanFunction(uintptr_t object, int32_t functionIndex, bool value);
     bool QueryBooleanFunction(uintptr_t object, int32_t functionIndex,
                               bool& outValue);

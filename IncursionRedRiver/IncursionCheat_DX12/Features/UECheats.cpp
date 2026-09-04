@@ -74,6 +74,8 @@ namespace
     uintptr_t g_flyModeAppliedComponent = 0;
 
     ULONGLONG g_staminaLastFunctionApply = 0;
+    ULONGLONG g_staminaLastMonitor = 0;
+    ULONGLONG g_lastPersistentFeatureTick = 0;
     bool g_staminaFunctionDispatch = false;
     float g_staminaCurrent = 0.0f;
     float g_staminaMaximum = 0.0f;
@@ -487,6 +489,7 @@ namespace
         // never writes stamina memory directly, so disabling it only resets local
         // bookkeeping and lets the game resume normal drain from its current value.
         g_staminaLastFunctionApply = 0;
+        g_staminaLastMonitor = 0;
         g_staminaFunctionDispatch = false;
         g_staminaCurrent = 0.0f;
         g_staminaMaximum = 0.0f;
@@ -498,6 +501,14 @@ namespace
 
     void ApplyInfiniteStamina()
     {
+        const ULONGLONG now = GetTickCount64();
+        // QueryFloatFunction is reflected game work. Sampling both stamina
+        // channels at 10 Hz is responsive enough to refill them while avoiding
+        // four ProcessEvent calls on every rendered frame.
+        if (g_staminaLastMonitor && now - g_staminaLastMonitor < 100)
+            return;
+        g_staminaLastMonitor = now;
+
         const auto& attributes = GameAccess::GetStaminaAttributes();
         if (attributes.empty())
         {
@@ -506,7 +517,6 @@ namespace
             return;
         }
 
-        const ULONGLONG now = GetTickCount64();
         const bool canApply = !g_staminaLastFunctionApply ||
             now - g_staminaLastFunctionApply >= 200;
         int validated = 0;
@@ -876,6 +886,15 @@ namespace UECheats
 
     void ProcessTick()
     {
+        const ULONGLONG now = GetTickCount64();
+        // Persistent memory edits need at most one application per 16 ms. This
+        // prevents high-refresh-rate Present hooks from multiplying identical
+        // writes while retaining a 60+ Hz response for recoil, sway and movement.
+        if (g_lastPersistentFeatureTick &&
+            now - g_lastPersistentFeatureTick < 16)
+            return;
+        g_lastPersistentFeatureTick = now;
+
         if (bGodMode)
         {
             ApplyGodMode();
@@ -927,6 +946,7 @@ namespace UECheats
         RestoreWeaponCondition();
         g_durabilityComponent = 0;
         g_lastDurabilityRequest = 0;
+        g_lastPersistentFeatureTick = 0;
         g_lastDurabilityBefore.store(-1.0f);
         g_lastDurabilityAfter.store(-1.0f);
         g_durabilityRepairState.store(0);

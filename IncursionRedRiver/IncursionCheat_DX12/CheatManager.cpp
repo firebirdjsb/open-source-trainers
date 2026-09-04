@@ -47,13 +47,13 @@ void CheatManager::Tick()
         return;
 
     const uint64_t now = GetTickCount64();
-    // Full world/local-player/actor acquisition is intentionally decoupled from
-    // Present. At 30 Hz the pointers remain responsive while actor enumeration,
-    // class tests, hostile-list reads and bone validation no longer tax every frame.
-    // Before a pawn is acquired, refresh quickly so loader-before-game startup is
-    // still responsive.
-    const uint64_t refreshInterval = Menu::bOpen ? 150u :
-        (GameAccess::GetLocalPawn() ? 33u : 8u);
+    // Full world/local-player/actor acquisition scans thousands of live actors and
+    // must not run at render frequency. Actor transforms, health and camera state
+    // are still sampled by the lightweight feature paths every frame; this cache
+    // only needs to track membership and pointer changes. During startup use a
+    // faster retry so loader-before-game acquisition remains responsive.
+    const uint64_t refreshInterval = Menu::bOpen ? 250u :
+        (GameAccess::GetLocalPawn() ? 100u : 25u);
     if (!m_lastRuntimeRefreshMs || now - m_lastRuntimeRefreshMs >= refreshInterval)
     {
         GameAccess::Refresh();

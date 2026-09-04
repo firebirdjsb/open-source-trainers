@@ -19,6 +19,7 @@ namespace Aimbot
         bool ActivationHeld = false;
         bool AimAttempted = false;
         bool UsedMouseInput = false;
+        bool UsedControllerLookInput = false;
         bool UsedCapsuleFallback = false;
         bool UsedSetControlRotationFunction = false;
         bool DirectWriteSucceeded = false;

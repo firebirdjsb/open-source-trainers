@@ -163,7 +163,8 @@ namespace
                 a.TargetFound ? "FOUND" : "NONE", a.RmbHeld ? "DOWN" : "UP",
                 a.LmbHeld ? "DOWN" : "UP", a.ActivationHeld ? "YES" : "NO",
                 a.AimAttempted ? "YES" : "NO");
-            ImGui::Text("Aim mode: %s", a.UsedMouseInput ? "MOUSE" : "CONTROL ROTATION");
+            ImGui::Text("Aim mode: %s", a.UsedMouseInput ? "MOUSE FALLBACK" :
+                (a.UsedControllerLookInput ? "ENGINE LOOK INPUT" : "CONTROL ROTATION"));
             ImGui::Text("Aim submission/write: %s | next-frame rotation changed: %s",
                 a.DirectWriteSucceeded ? "OK" : "NO",
                 a.RotationChangedAfterAttempt ? "YES" : "NO");

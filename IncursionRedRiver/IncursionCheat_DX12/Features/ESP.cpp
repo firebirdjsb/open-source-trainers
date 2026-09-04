@@ -42,6 +42,8 @@ namespace
         FVector Location{};
         float DistanceMeters = 0.0f;
         float HalfHeight = 88.0f;
+        Vector2 Screen{};
+        GameAccess::Health HealthState{};
         bool Hostile = false;
         bool OnScreen = false;
     };
@@ -161,17 +163,15 @@ namespace ESP
             // when the transient team list is unavailable.
             if (!confirmedHostile)
                 continue;
-            bool actorAlive = true;
-            if (GameAccess::GetCachedActorState(actor, actorAlive, 1200) &&
-                !actorAlive)
-                continue;
-
             FVector location{};
             if (!GameAccess::GetActorLocation(actor, location))
                 continue;
 
             const float distanceMeters = static_cast<float>(localPos.Distance(location) / 100.0);
             if (distanceMeters > maxDistanceMeters)
+                continue;
+            const auto health = GameAccess::GetHealth(actor);
+            if (!health.Valid || health.Dead || health.Current <= health.Minimum)
                 continue;
 
             Vector2 centerScreen{};
@@ -182,7 +182,7 @@ namespace ESP
                 centerScreen.y <= display.y + 80.0f;
             candidates.push_back({ actor, location, distanceMeters,
                                    GameAccess::GetCapsuleHalfHeight(actor),
-                                   confirmedHostile, onScreen });
+                                   centerScreen, health, confirmedHostile, onScreen });
         }
 
         g_lastCandidateCount = static_cast<int>(candidates.size());
@@ -203,17 +203,11 @@ namespace ESP
         priorities.reserve(candidates.size());
         for (const Candidate& candidate : candidates)
         {
-            if (!candidate.Hostile)
+            if (!candidate.Hostile || !candidate.OnScreen)
                 continue;
-            Vector2 screen{};
-            const bool projected = WorldToScreen::Convert(candidate.Location, screen,
-                camera.Location, camera.Rotation, camera.FOV, width, height);
-            const bool onScreen = projected && screen.x >= -80.0f &&
-                screen.x <= display.x + 80.0f && screen.y >= -80.0f &&
-                screen.y <= display.y + 80.0f;
-            const float score = onScreen ?
-                std::hypot(screen.x - display.x * 0.5f,
-                           screen.y - display.y * 0.5f) : 1000000000.0f;
+            const float score = std::hypot(
+                candidate.Screen.x - display.x * 0.5f,
+                candidate.Screen.y - display.y * 0.5f);
             priorities.push_back({ candidate.Actor, score });
         }
         std::sort(priorities.begin(), priorities.end(),
@@ -256,21 +250,7 @@ namespace ESP
                 topY + boxHeight < 0.0f || topY > display.y)
                 continue;
 
-            const auto health = GameAccess::GetHealth(candidate.Actor);
-            // A current hostile-list entry can briefly outlive its streamed actor.
-            // Require the live IRR health object before drawing; every active raid
-            // NPC owns one, whereas preview/stale entries do not.
-            if (!health.Valid || health.Dead || health.Current <= health.Minimum)
-                continue;
-
-            // Actor-state reflection is optional and must never blank the complete
-            // ESP layer when a native lifecycle function is unavailable. Health and
-            // authoritative hostile membership establish liveness above; a cached
-            // destroyed result remains an additional rejection when available.
-            bool actorAlive = true;
-            if (GameAccess::GetCachedActorState(candidate.Actor, actorAlive, 1200) &&
-                !actorAlive)
-                continue;
+            const auto& health = candidate.HealthState;
             bool visible = false;
             const bool visibilityKnown = GameAccess::GetCachedVisibility(
                 candidate.Actor, visible, nullptr, 800);
