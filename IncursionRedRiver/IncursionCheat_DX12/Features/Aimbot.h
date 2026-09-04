@@ -20,6 +20,7 @@ namespace Aimbot
         bool AimAttempted = false;
         bool UsedMouseInput = false;
         bool UsedControllerLookInput = false;
+        bool MousePacketAccepted = false;
         bool UsedCapsuleFallback = false;
         bool UsedSetControlRotationFunction = false;
         bool DirectWriteSucceeded = false;
@@ -33,6 +34,9 @@ namespace Aimbot
         float PredictedFlightTime = 0.0f;
         float ProjectileSpeed = 0.0f;
         uintptr_t TargetBodyComponent = 0;
+        long MouseDeltaX = 0;
+        long MouseDeltaY = 0;
+        uint32_t MouseInputError = 0;
         int CharactersScanned = 0;
         int EnemyCandidates = 0;
         int LivingCandidates = 0;

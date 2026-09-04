@@ -207,6 +207,9 @@ namespace DiagnosticsService
             << " sticky=" << YesNo(a.StickyTarget)
             << " mouseInput=" << YesNo(a.UsedMouseInput)
             << " engineLookInput=" << YesNo(a.UsedControllerLookInput)
+            << " mouseAccepted=" << YesNo(a.MousePacketAccepted)
+            << " mouseDelta={" << a.MouseDeltaX << "," << a.MouseDeltaY << "}"
+            << " mouseError=" << a.MouseInputError
             << " setControlRotation=" << YesNo(a.UsedSetControlRotationFunction) << "\n";
         out << "Scan counts: characters=" << a.CharactersScanned
             << " enemies=" << a.EnemyCandidates

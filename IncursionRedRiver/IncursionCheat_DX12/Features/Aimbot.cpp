@@ -18,6 +18,8 @@ namespace
 {
     constexpr double Pi = 3.14159265358979323846;
     Aimbot::Diagnostics g_aimDiagnostics{};
+    Aimbot::Diagnostics g_lastActivationDiagnostics{};
+    ULONGLONG g_lastActivationDiagnosticsAt = 0;
     uintptr_t g_lockedActor = 0;
 
     struct AimCandidate
@@ -51,8 +53,13 @@ namespace
         return out;
     }
 
-    bool ApplyMouseAim(const Vector2& target, const Vector2& center, float smoothing, float strength)
+    bool ApplyMouseAim(const Vector2& target, const Vector2& center,
+                       float smoothing, float strength, LONG& outMoveX,
+                       LONG& outMoveY, DWORD& outError)
     {
+        outMoveX = 0;
+        outMoveY = 0;
+        outError = ERROR_SUCCESS;
         const double smooth = std::max(1.0, static_cast<double>(smoothing));
         const double factor = static_cast<double>(strength) / smooth;
         double dx = static_cast<double>(target.x - center.x) * factor;
@@ -67,15 +74,21 @@ namespace
             moveX = target.x > center.x ? 1 : -1;
         if (moveY == 0 && std::abs(target.y - center.y) > 0.75f)
             moveY = target.y > center.y ? 1 : -1;
+        outMoveX = moveX;
+        outMoveY = moveY;
         if (moveX == 0 && moveY == 0)
-            return false;
+            return true;
 
         INPUT input{};
         input.type = INPUT_MOUSE;
         input.mi.dx = moveX;
         input.mi.dy = moveY;
         input.mi.dwFlags = MOUSEEVENTF_MOVE;
-        return SendInput(1, &input, sizeof(input)) == 1;
+        SetLastError(ERROR_SUCCESS);
+        const bool accepted = SendInput(1, &input, sizeof(input)) == 1;
+        if (!accepted)
+            outError = GetLastError();
+        return accepted;
     }
 
     bool GetCapsuleTarget(uintptr_t actor, const std::string& targetName, FVector& out)
@@ -126,11 +139,20 @@ namespace Aimbot
 
     void Run()
     {
+        const ULONGLONG now = GetTickCount64();
+        if (g_aimDiagnostics.ActivationHeld || g_aimDiagnostics.AimAttempted)
+        {
+            g_lastActivationDiagnostics = g_aimDiagnostics;
+            g_lastActivationDiagnosticsAt = now;
+        }
         // Preserve the last active-frame counters while the diagnostics menu is
         // open. Clearing them before this guard made every saved dump report zero
         // scanned actors even when acquisition had been running correctly.
         if (Menu::bOpen)
         {
+            if (g_lastActivationDiagnosticsAt &&
+                now - g_lastActivationDiagnosticsAt < 15000)
+                g_aimDiagnostics = g_lastActivationDiagnostics;
             g_lockedActor = 0;
             return;
         }
@@ -340,7 +362,7 @@ namespace Aimbot
             bool visible = false;
             FVector exposed{};
             const bool known = GameAccess::GetCachedVisibility(candidate.Actor,
-                visible, &exposed, g_aimDiagnostics.ActivationHeld ? 550u : 900u);
+                visible, &exposed, 800u);
             candidate.VisibilityKnown = known;
             candidate.VisibilityVisible = known && visible;
             if (!known)
@@ -406,11 +428,12 @@ namespace Aimbot
         const AimCandidate* locked = nullptr;
         if (g_lockedActor && g_aimDiagnostics.ActivationHeld)
         {
+            const float retentionRadius = std::max(fovRadius * 2.5f, 75.0f);
             const auto foundLock = std::find_if(candidates.begin(), candidates.end(),
-                [](const AimCandidate& candidate)
+                [retentionRadius](const AimCandidate& candidate)
                 { return candidate.Actor == g_lockedActor &&
                          candidate.VisibilityKnown && candidate.VisibilityVisible &&
-                         candidate.ScreenDistance <= fovRadius; });
+                         candidate.ScreenDistance <= retentionRadius; });
             if (foundLock != candidates.end())
                 locked = &*foundLock;
         }
@@ -518,10 +541,30 @@ namespace Aimbot
                         g_aimDiagnostics.RotationBefore);
         g_aimDiagnostics.AimAttempted = true;
 
-        // Feed the angular error through the dump-confirmed PlayerController look
-        // functions on the UE window/game thread. This is the same accumulator the
-        // game's normal camera input consumes, so Enhanced Input cannot overwrite
-        // the lock on its next update. Requests are coalesced to one latest delta.
+        // This title's camera stack overwrites control rotation during Enhanced
+        // Input processing. Feed it relative mouse-look first: this is the same
+        // path proven to move the camera during ordinary ADS, and it runs every
+        // active frame so the lock follows a moving target.
+        if (bUseMouseInput)
+        {
+            g_aimDiagnostics.UsedMouseInput = true;
+            LONG moveX = 0;
+            LONG moveY = 0;
+            DWORD inputError = ERROR_SUCCESS;
+            g_aimDiagnostics.DirectWriteSucceeded = ApplyMouseAim(
+                chosen.Screen, center, bSmoothAim ? smoothAmount : 1.0f,
+                aimStrength, moveX, moveY, inputError);
+            g_aimDiagnostics.MouseDeltaX = moveX;
+            g_aimDiagnostics.MouseDeltaY = moveY;
+            g_aimDiagnostics.MouseInputError = inputError;
+            g_aimDiagnostics.MousePacketAccepted =
+                g_aimDiagnostics.DirectWriteSucceeded;
+            if (g_aimDiagnostics.DirectWriteSucceeded)
+                return;
+        }
+
+        // If Windows input cannot be submitted, use the dump-confirmed
+        // PlayerController look functions on the UE window/game thread.
         FRotator current = Memory::Read<FRotator>(controller + Offsets::AController_ControlRotation);
         const FRotator desired = LookAt(camera.Location, chosen.Target);
         const double factor = bSmoothAim ? std::clamp(1.0 / static_cast<double>(smoothAmount), 0.01, 1.0) : 1.0;
@@ -545,16 +588,6 @@ namespace Aimbot
         if (g_aimDiagnostics.DirectWriteSucceeded)
             return;
 
-        // Last-resort compatibility path for builds that do not accept the
-        // reflected rotation call.  This is only used when explicitly enabled;
-        // the native game-thread path above remains the normal input method.
-        if (bUseMouseInput)
-        {
-            g_aimDiagnostics.UsedMouseInput = true;
-            g_aimDiagnostics.DirectWriteSucceeded = ApplyMouseAim(
-                chosen.Screen, center, bSmoothAim ? smoothAmount : 1.0f,
-                aimStrength);
-        }
     }
 
     void RenderTab()
@@ -567,7 +600,7 @@ namespace Aimbot
         if (bSmoothAim)
             ImGui::SliderFloat("Smooth Amount", &smoothAmount, 1.0f, 25.0f, "%.1f");
 
-        ImGui::Checkbox("Use Mouse Input Fallback", &bUseMouseInput);
+        ImGui::Checkbox("Use primary mouse-look input", &bUseMouseInput);
         if (bUseMouseInput)
             ImGui::SliderFloat("Aim Strength", &aimStrength, 0.10f, 2.50f, "%.2f");
 
@@ -588,7 +621,7 @@ namespace Aimbot
                 selectedBone = bone;
         }
         ImGui::TextWrapped("Hold RMB to aim, or fire with LMB when Aim while firing is enabled. Both inputs use the same FOV and exposure rules. The selected bone is preferred; if it is covered but another body anchor is exposed, that exposed anchor becomes the safe aim point.");
-        ImGui::TextWrapped("Aim uses dump-validated PlayerController AddPitchInput/AddYawInput on the UE game thread, following the game's normal look accumulator every frame. SetControlRotation and mouse input remain bounded compatibility fallbacks.");
+        ImGui::TextWrapped("Aim uses relative mouse-look while ADS/fire is held because this title's Enhanced Input camera overwrites control-rotation changes. Dump-validated AddPitchInput/AddYawInput and SetControlRotation remain fallbacks if Windows input submission fails.");
         ImGui::TextWrapped("Targets must be present in the validated local IRRTeamComponent Hostiles array; unknown/neutral IRR candidates are never selected.");
         ImGui::Text("Scan %d | hostile %d | living %d | range %d | projected %d | FOV %d",
             g_aimDiagnostics.CharactersScanned, g_aimDiagnostics.EnemyCandidates,
