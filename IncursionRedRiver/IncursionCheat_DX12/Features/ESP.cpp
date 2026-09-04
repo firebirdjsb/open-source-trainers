@@ -257,15 +257,18 @@ namespace ESP
                 continue;
 
             const auto health = GameAccess::GetHealth(candidate.Actor);
-            if (health.Valid && (health.Dead || health.Current <= health.Minimum))
+            // A current hostile-list entry can briefly outlive its streamed actor.
+            // Require the live IRR health object before drawing; every active raid
+            // NPC owns one, whereas preview/stale entries do not.
+            if (!health.Valid || health.Dead || health.Current <= health.Minimum)
                 continue;
 
-            // Do not draw an unvalidated actor or an unfinished visibility query.
-            // This removes transient/phantom rectangles during level streaming and
-            // keeps the color contract unambiguous: green is a completed visible
-            // trace, red is a completed occluded trace.
-            bool actorAlive = false;
-            if (!GameAccess::GetCachedActorState(candidate.Actor, actorAlive, 1200) ||
+            // Actor-state reflection is optional and must never blank the complete
+            // ESP layer when a native lifecycle function is unavailable. Health and
+            // authoritative hostile membership establish liveness above; a cached
+            // destroyed result remains an additional rejection when available.
+            bool actorAlive = true;
+            if (GameAccess::GetCachedActorState(candidate.Actor, actorAlive, 1200) &&
                 !actorAlive)
                 continue;
             bool visible = false;
@@ -342,6 +345,6 @@ namespace ESP
             g_lastVisibleCount, g_lastHiddenCount);
         ImGui::TextWrapped("ESP is projected from LastFrameCameraCachePrivate, matching the backbuffer being presented instead of a newer game-thread camera. A small adaptive filter removes sub-frame jitter but responds immediately to real turns and target movement. No per-actor ProcessEvent projection calls are made.");
         ImGui::TextWrapped("Actor discovery is based on actual IRRBaseCharacter class identity and remains independent of local-pawn acquisition; health is a secondary living/dead filter.");
-        ImGui::TextWrapped("Confirmed hostiles share the aimbot's budgeted multi-point exposure cache: green means at least one live body anchor is visible, while red means a completed trace found the actor occluded. Actors remain hidden until their native state and visibility samples are valid, preventing phantom boxes during streaming.");
+        ImGui::TextWrapped("Confirmed live hostiles share the aimbot's budgeted visibility-channel trace cache: green means at least one body anchor has a clear camera ray, while red means world geometry blocked every tested anchor. Stale hostiles without a live health object are rejected.");
     }
 }

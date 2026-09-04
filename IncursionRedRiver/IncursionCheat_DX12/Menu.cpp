@@ -189,6 +189,10 @@ namespace
             ImGui::Text("Exposure game thread: 0x%X | last batch %d / visible %d",
                 visibility.LastSampleThreadId, visibility.LastRequestedActors,
                 visibility.LastVisibleActors);
+            ImGui::Text("Trace methods: exact %d / clear %d | native LOS %d | sphere fallback %d",
+                visibility.LastLineTraceActors,
+                visibility.LastLineTraceVisibleActors,
+                visibility.LastNativeLosActors, visibility.LastSphereActors);
             ImGui::Text("Target world: { %.3f, %.3f, %.3f }",
                 a.TargetWorld.X, a.TargetWorld.Y, a.TargetWorld.Z);
             ImGui::Text("Control before: { %.3f, %.3f, %.3f }",

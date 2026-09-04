@@ -230,6 +230,10 @@ namespace DiagnosticsService
             << " taskPending=" << YesNo(visibility.TaskPending)
             << " lastBatch=" << visibility.LastRequestedActors
             << " lastVisible=" << visibility.LastVisibleActors
+            << " exactTrace=" << visibility.LastLineTraceActors
+            << " exactClear=" << visibility.LastLineTraceVisibleActors
+            << " nativeLOS=" << visibility.LastNativeLosActors
+            << " sphereFallback=" << visibility.LastSphereActors
             << " thread=0x" << std::hex << visibility.LastSampleThreadId
             << std::dec << "\n";
         out << "Target world={" << a.TargetWorld.X << ',' << a.TargetWorld.Y << ','

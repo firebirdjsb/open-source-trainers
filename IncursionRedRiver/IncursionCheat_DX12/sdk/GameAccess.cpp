@@ -113,6 +113,8 @@ namespace
         std::array<FVector, 10> Points{};
         uint8_t PointCount = 0;
         float BroadRadius = 75.0f;
+        bool ActorStateKnown = false;
+        bool ActorDestroyed = false;
     };
 
     GameAccess::RuntimeDiagnostics g_diag{};
@@ -155,6 +157,10 @@ namespace
     std::atomic<uint32_t> g_visibilityLastSampleThreadId{ 0 };
     std::atomic<int32_t> g_visibilityLastRequestedActors{ 0 };
     std::atomic<int32_t> g_visibilityLastVisibleActors{ 0 };
+    std::atomic<int32_t> g_visibilityLastLineTraceActors{ 0 };
+    std::atomic<int32_t> g_visibilityLastLineTraceVisibleActors{ 0 };
+    std::atomic<int32_t> g_visibilityLastNativeLosActors{ 0 };
+    std::atomic<int32_t> g_visibilityLastSphereActors{ 0 };
     std::atomic<ULONGLONG> g_visibilityLastCompletedAt{ 0 };
     ULONGLONG g_lastVisibilityRequestAt = 0;
     uintptr_t g_visibilityCacheWorld = 0;
@@ -1180,6 +1186,10 @@ namespace GameAccess
         g_visibilityLastSampleThreadId.store(0);
         g_visibilityLastRequestedActors.store(0);
         g_visibilityLastVisibleActors.store(0);
+        g_visibilityLastLineTraceActors.store(0);
+        g_visibilityLastLineTraceVisibleActors.store(0);
+        g_visibilityLastNativeLosActors.store(0);
+        g_visibilityLastSphereActors.store(0);
         g_visibilityLastCompletedAt.store(0);
         g_lastVisibilityRequestAt = 0;
         g_isAResultCache.clear();
@@ -1650,6 +1660,11 @@ namespace GameAccess
         }
         out.LastRequestedActors = g_visibilityLastRequestedActors.load();
         out.LastVisibleActors = g_visibilityLastVisibleActors.load();
+        out.LastLineTraceActors = g_visibilityLastLineTraceActors.load();
+        out.LastLineTraceVisibleActors =
+            g_visibilityLastLineTraceVisibleActors.load();
+        out.LastNativeLosActors = g_visibilityLastNativeLosActors.load();
+        out.LastSphereActors = g_visibilityLastSphereActors.load();
         out.LastCompletedAt = g_visibilityLastCompletedAt.load();
         out.LastSampleThreadId = g_visibilityLastSampleThreadId.load();
         out.TaskPending = g_visibilityTaskPending.load();
@@ -2175,7 +2190,10 @@ namespace GameAccess
         const uintptr_t world = GetWorld();
         const uintptr_t library = GetObjectByIndex(
             ObjectIndices::DefaultGeneralFunctionLibrary);
+        const uintptr_t kismetLibrary = GetObjectByIndex(
+            ObjectIndices::DefaultKismetSystemLibrary);
         const uintptr_t controller = GetLocalController();
+        const uintptr_t localPawn = GetLocalPawn();
         const Camera camera = GetRenderCamera();
         if (actors.empty() || !world || !library || !camera.Valid ||
             !GetGameWindowThreadId())
@@ -2202,6 +2220,13 @@ namespace GameAccess
             work.ObserverLocation = camera.Location;
             if (!GetActorLocation(actor, work.ActorLocation))
                 continue;
+            const Health health = GetHealth(actor);
+            if (health.Valid)
+            {
+                work.ActorStateKnown = true;
+                work.ActorDestroyed = health.Dead ||
+                    health.Current <= health.Minimum;
+            }
             work.BroadRadius = std::clamp(GetCapsuleHalfHeight(actor) * 0.90f,
                                           45.0f, 95.0f);
 
@@ -2307,7 +2332,7 @@ namespace GameAccess
             static_cast<int32_t>(requested.size()));
         g_visibilityTaskPending.store(true);
         if (!QueueGameThreadTask([requested = std::move(requested), world,
-                                  library, controller]()
+                                  library, kismetLibrary, controller, localPawn]()
             {
                 struct ProbeResult
                 {
@@ -2388,24 +2413,65 @@ namespace GameAccess
                     return ProbeResult{ invoked, invoked && params[0x40] != 0 };
                 };
 
+                // Use the engine's visibility trace channel for the actual wall
+                // decision. The target actor and local pawn are explicit ignores:
+                // a blocking hit therefore means world geometry is between the
+                // camera and this exact body point, while no hit means exposed.
+                // This avoids depending on Controller::LineOfSightTo implementations
+                // that reject non-player AI actors in this title.
+                auto lineTraceVisible = [&](uintptr_t actor,
+                                            const FVector& observer,
+                                            const FVector& point)
+                {
+                    if (!kismetLibrary || !actor || !observer.IsFinite() ||
+                        !point.IsFinite())
+                        return ProbeResult{};
+
+                    alignas(16) std::array<uint8_t, 0x188> params{};
+                    const uintptr_t context = localPawn ? localPawn : world;
+                    std::memcpy(params.data() + 0x00, &context, sizeof(context));
+                    std::memcpy(params.data() + 0x08, &observer, sizeof(observer));
+                    std::memcpy(params.data() + 0x20, &point, sizeof(point));
+                    params[0x38] = 0; // TraceTypeQuery1 / visibility channel
+                    params[0x39] = 0; // simple collision is sufficient for walls
+
+                    std::array<uintptr_t, 2> ignored{ localPawn, actor };
+                    struct RawPointerArray
+                    {
+                        uintptr_t Data = 0;
+                        int32_t Count = 0;
+                        int32_t Capacity = 0;
+                    } ignoreArray{};
+                    ignoreArray.Data = reinterpret_cast<uintptr_t>(ignored.data());
+                    ignoreArray.Count = localPawn ? 2 : 1;
+                    ignoreArray.Capacity = ignoreArray.Count;
+                    if (!localPawn)
+                        ignored[0] = actor;
+                    std::memcpy(params.data() + 0x40, &ignoreArray,
+                                sizeof(ignoreArray));
+                    params[0x50] = 0;  // EDrawDebugTrace::None
+                    params[0x158] = 1; // bIgnoreSelf
+
+                    const bool invoked = InvokeFunctionRaw(kismetLibrary,
+                        FunctionIndices::KismetSystemLibrary_LineTraceSingle,
+                        params.data(), params.size());
+                    const bool blockingHit = invoked && params[0x180] != 0;
+                    return ProbeResult{ invoked, invoked && !blockingHit };
+                };
+
                 std::vector<std::pair<uintptr_t, VisibilityCacheEntry>> completed;
                 completed.reserve(requested.size());
                 int32_t visibleCount = 0;
+                int32_t lineTraceActors = 0;
+                int32_t lineTraceVisibleActors = 0;
+                int32_t nativeLosActors = 0;
+                int32_t sphereActors = 0;
                 for (const VisibilityWork& work : requested)
                 {
                     VisibilityCacheEntry result{};
                     result.ActorLocation = work.ActorLocation;
-                    bool actorStateSucceeded = false;
-                    if (GetWorld() == world)
-                    {
-                        alignas(8) std::array<uint8_t, 8> actorStateParams{};
-                        actorStateSucceeded = InvokeFunctionRaw(work.Actor,
-                            FunctionIndices::Actor_IsActorBeingDestroyed,
-                            actorStateParams.data(), actorStateParams.size());
-                        result.ActorStateKnown = actorStateSucceeded;
-                        result.ActorDestroyed = actorStateSucceeded &&
-                            actorStateParams[0] != 0;
-                    }
+                    result.ActorStateKnown = work.ActorStateKnown;
+                    result.ActorDestroyed = work.ActorDestroyed;
                     // A destroyed actor can remain in ULevel::Actors until the
                     // next GC pass.  Publish its state to the shared cache, but do
                     // not spend LOS work or render it as a target.
@@ -2419,23 +2485,54 @@ namespace GameAccess
                     const FVector observer = haveEngineViewPoint ?
                         engineViewPoint : work.ObserverLocation;
 
-                    // Prefer the native actor trace. It tests the actual actor and
-                    // avoids the false-negative window while CheckSphereVisibility
-                    // is still waiting for its Blueprint camera context. Once the
-                    // actor is known visible, retain the selected body point and use
-                    // sphere samples only to find a more exposed limb/anchor.
+                    // Trace the preferred point followed by representative live
+                    // anchors. Six traces cover head/neck/torso/arms without turning
+                    // a crowded raid into hundreds of per-frame ProcessEvent calls.
+                    bool exactTraceInvoked = false;
+                    const uint8_t traceCount = std::min<uint8_t>(work.PointCount, 6);
+                    for (uint8_t index = 0; index < traceCount &&
+                         GetWorld() == world; ++index)
+                    {
+                        const ProbeResult pointTrace = lineTraceVisible(work.Actor,
+                            observer, work.Points[index]);
+                        exactTraceInvoked = exactTraceInvoked || pointTrace.Invoked;
+                        if (!pointTrace.Hit)
+                            continue;
+                        result.Visible = true;
+                        result.ExposedPoint = work.Points[index];
+                        ++visibleCount;
+                        break;
+                    }
+                    if (exactTraceInvoked)
+                    {
+                        ++lineTraceActors;
+                        if (result.Visible)
+                            ++lineTraceVisibleActors;
+                    }
+
+                    // Fall back only when the exact trace function could not be
+                    // dispatched. A completed blocking trace must never be replaced
+                    // by a broad sphere result, which was the old false-green path.
                     ProbeResult actorProbe{};
-                    if (GetWorld() == world)
+                    if (!exactTraceInvoked && GetWorld() == world)
+                    {
                         actorProbe = controllerLineOfSight(work.Actor, observer);
+                        if (actorProbe.Invoked)
+                            ++nativeLosActors;
+                    }
                     const bool actorVisible = actorProbe.Hit;
                     ProbeResult broadProbe{};
-                    if (!actorVisible && GetWorld() == world)
+                    if (!exactTraceInvoked && !actorVisible && GetWorld() == world)
+                    {
                         broadProbe = checkSphere(observer, work.ActorLocation,
                                                  work.BroadRadius, 9);
+                        if (broadProbe.Invoked)
+                            ++sphereActors;
+                    }
                     const bool broadVisible = broadProbe.Hit;
-                    bool querySucceeded = actorStateSucceeded ||
+                    bool querySucceeded = exactTraceInvoked ||
                         actorProbe.Invoked || broadProbe.Invoked;
-                    if (actorVisible || broadVisible)
+                    if (!result.Visible && (actorVisible || broadVisible))
                     {
                         for (uint8_t index = 0; index < work.PointCount; ++index)
                         {
@@ -2499,6 +2596,11 @@ namespace GameAccess
                     }
                 }
                 g_visibilityLastVisibleActors.store(visibleCount);
+                g_visibilityLastLineTraceActors.store(lineTraceActors);
+                g_visibilityLastLineTraceVisibleActors.store(
+                    lineTraceVisibleActors);
+                g_visibilityLastNativeLosActors.store(nativeLosActors);
+                g_visibilityLastSphereActors.store(sphereActors);
                 g_visibilityLastSampleThreadId.store(GetCurrentThreadId());
                 g_visibilityLastCompletedAt.store(completedAt);
                 g_visibilityTaskPending.store(false);

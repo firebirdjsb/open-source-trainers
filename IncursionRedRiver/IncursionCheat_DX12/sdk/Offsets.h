@@ -217,6 +217,7 @@ namespace ObjectIndices
     constexpr int32_t Package_ID_HealthInjector  = 0x0C85C;
     constexpr int32_t DefaultInventoryFunctionLibrary = 0x0907C;
     constexpr int32_t DefaultGameplayStatics     = 0x0874F;
+    constexpr int32_t DefaultKismetSystemLibrary = 0x08761;
     constexpr int32_t DefaultGeneralFunctionLibrary = 0x08F1B;
 }
 
@@ -226,6 +227,7 @@ namespace FunctionIndices
 {
     constexpr int32_t PrimitiveComponent_GetCollisionEnabled = 0x1F5E;
     constexpr int32_t PrimitiveComponent_SetCollisionEnabled = 0x1FA6;
+    constexpr int32_t KismetSystemLibrary_LineTraceSingle = 0x1CD2;
     constexpr int32_t Actor_DisableInput = 0x291F;
     constexpr int32_t Actor_EnableInput = 0x2920;
     constexpr int32_t Actor_GetActorEnableCollision = 0x2926;

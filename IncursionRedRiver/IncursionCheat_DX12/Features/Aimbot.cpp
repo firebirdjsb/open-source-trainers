@@ -126,6 +126,15 @@ namespace Aimbot
 
     void Run()
     {
+        // Preserve the last active-frame counters while the diagnostics menu is
+        // open. Clearing them before this guard made every saved dump report zero
+        // scanned actors even when acquisition had been running correctly.
+        if (Menu::bOpen)
+        {
+            g_lockedActor = 0;
+            return;
+        }
+
         FRotator observed{};
         bool rotationChanged = false;
         if (g_aimDiagnostics.AimAttempted && g_aimDiagnostics.Controller &&
@@ -146,15 +155,6 @@ namespace Aimbot
 
         if (bDrawFov && fovRadius > 1.0f)
             Renderer::DrawCircle(center.x, center.y, fovRadius, IM_COL32(255, 255, 255, 100));
-
-        // Keep the visual FOV available for tuning, but never submit aim input while
-        // the menu owns the mouse. GetAsyncKeyState still sees physical buttons even when
-        // Win32 raw input is swallowed, so this guard prevents menu clicks from aiming.
-        if (Menu::bOpen)
-        {
-            g_lockedActor = 0;
-            return;
-        }
 
         if (!bEnabled)
         {
@@ -192,7 +192,8 @@ namespace Aimbot
             if (GameAccess::GetCachedActorState(actor, actorAlive, 1200) &&
                 !actorAlive)
                 continue;
-            if (!GameAccess::IsLivingCharacter(actor))
+            const auto health = GameAccess::GetHealth(actor);
+            if (!health.Valid || health.Dead || health.Current <= health.Minimum)
                 continue;
             ++g_aimDiagnostics.LivingCandidates;
 
